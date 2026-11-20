@@ -138,7 +138,7 @@ A correct sync decision is not the same as a safe file operation, so 0.2 checks 
 - **Held files.** A path is only treated as deleted when it is confirmed absent. Anything ignored, over 100 MB, unreadable, behind a link or otherwise unsure is *held*: listed in `status` under **HELD**, never pushed, pulled or deleted, and its last agreed state is kept.
 - **Pull preconditions.** Downloads go to a temp file first. Right before a file is replaced or deleted, its current content is compared with what the scan saw. If it changed, that file is skipped (your edit is kept) and it shows up again on the next run, usually as a conflict.
 - **One operation at a time.** Every push, pull, sync, link or init holds an OS-level lock on `.ghsync/lock`. A second ghsync (another window, the CLI, the tray) is refused with the owner's PID. The OS releases the lock if the process dies, so a crash never leaves a stale lock behind.
-- **Atomic state.** `state.json`, `config.json` and `cache.json` are written to a temp file, flushed and renamed, so a crash leaves the previous version intact. A damaged `state.json` stops the run with instructions instead of being silently reset. Pull results are saved before the push starts. Temp files from an interrupted run are cleaned up on the next one.
+- **Atomic state.** `state.json`, `config.json` and `cache.json` are written to a temp file, flushed and renamed, so a crash leaves the previous version intact. A damaged `state.json` stops the run with instructions instead of being silently reset. Pull results are saved before the push starts. If a pull is interrupted, the next run removes its leftover temp files, but only ones ghsync can prove it created: each pull records a run ID in `.ghsync/journal.json` before writing any temp file, and cleanup deletes only exact `.ghsync-<run id>-<n>.ghsync-tmp` names from a recorded run. Your own files are never deleted by cleanup, whatever they're called.
 - **Approval is bound to execution.** The GUI fingerprints the exact plan you confirmed. If the folder or GitHub changed in between, nothing runs and the list refreshes.
 
 **Recovering from an interruption:** just run `sync` again. Files already transferred compare equal on both sides and are recorded as in sync; anything unfinished is planned again. If `state.json` is ever damaged, delete it and run `status`: with no previous state ghsync never deletes anything, and differing files show as conflicts.
@@ -147,7 +147,7 @@ To unlink a folder, delete its `.ghsync/` directory. To sign out, delete `~/.ghs
 
 ## Ignore rules
 
-Skipped by default: `.git/`, `.ghsync/`, `node_modules/`, `__pycache__/`, `*.pyc`, `.DS_Store`, `Thumbs.db`, `desktop.ini`, `.env`, `.venv/`, `venv/`.
+Skipped by default: `.git/`, `.ghsync/`, `node_modules/`, `__pycache__/`, `*.pyc`, `.DS_Store`, `Thumbs.db`, `desktop.ini`, `.env`, `.venv/`, `venv/`, `*.ghsync-tmp`. That last suffix is reserved: files ending in it are never synced, but ghsync never deletes them either unless it created them itself.
 
 Add your own in a `.ghignore` file in the project root. If there is no `.ghignore`, an existing `.gitignore` is used instead.
 
@@ -162,15 +162,16 @@ Ignore rules apply to both sides. Ignoring a file that was already synced does *
 - **Comparison is byte for byte.** There is no line-ending normalisation, so a file with CRLF locally and LF on GitHub counts as changed.
 - **Files over 100 MB are skipped** (GitHub's limit). Very large files upload through the REST API as base64 and can be slow.
 - **Empty folders and symlinks are not synced.** Local symlinks and junctions are skipped (and listed as held); symlinks and submodules on GitHub are left alone. Existing files keep their executable bit on both sides; new files are created as non-executable.
+- **Known issue (GHS-010, low):** if a pull is killed mid-write and that folder is then added to your ignore rules, the leftover `.ghsync-<id>-<n>.ghsync-tmp` file there isn't cleaned up. It's harmless and never synced; delete it by hand. A fix is planned.
 - **Remaining race window.** The containment checks run immediately before each rename, but on Windows there is no way to rule out a folder being swapped for a junction in the instant between the check and the rename. That would need someone actively racing ghsync on your own machine; a hostile repository alone can't do it.
 - **Very large repos:** if GitHub truncates the file listing, `ghsync` refuses to sync rather than guess.
 - **The token is stored in plain text** in `~/.ghsync_token`. Use a fine-grained token limited to the repos you sync. Windows Credential Manager support is planned.
 
 ## Status
 
-0.2, "Safe Sync". This release fixes the filesystem-safety, concurrency and recovery findings from an independent review (GHS-001 to GHS-008) and adds no new features.
+0.2.1, "Safe Sync". 0.2 fixed the filesystem-safety, concurrency and recovery findings from an independent review (GHS-001 to GHS-008); 0.2.1 fixes the one defect found in the follow-up review (GHS-009: temp cleanup could delete user files ending in `.ghsync-tmp`). No new features.
 
-The regression suite in `tests/` runs against an in-memory GitHub, over real HTTP for the CLI, and drives the real GUI offscreen. Every fix has a test that fails on 0.1 and passes on 0.2.
+The regression suite in `tests/` runs against an in-memory GitHub, over real HTTP for the CLI, and drives the real GUI offscreen. Every fix has a test that fails on the build before it and passes on 0.2.1. On Windows the suite also creates real NTFS junctions (`mklink /J`, no admin rights needed) and uses the real `msvcrt` lock.
 
 ```
 run_tests.bat                                   # or: python -m unittest discover -s tests -v

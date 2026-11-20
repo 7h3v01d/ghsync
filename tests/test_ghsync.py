@@ -473,13 +473,96 @@ class TestGHS006AtomicState(Base):
         tmp = [f for d, _, fs in os.walk(self.root) for f in fs if f.endswith(".ghsync-tmp")]
         self.assertEqual(tmp, [])
 
-    def test_leftover_temp_files_are_cleaned(self):
-        self.synced({"a.txt": "a"})
-        self.write("sub/.a.txt.1234.ghsync-tmp", "half")
-        self.write("old.txt.ghsync-tmp", "half")
+
+
+# ============================ GHS-009: temp cleanup only deletes files ghsync created
+CRASH_CHILD = r"""
+import argparse, os, sys
+sys.path.insert(0, sys.argv[1])
+import ghsync
+root = sys.argv[2]
+real = ghsync._replace
+def crash(src, dst):
+    if os.sep + ".ghsync" + os.sep not in dst:   # die mid-pull, after the temp file is written
+        os._exit(9)
+    return real(src, dst)
+ghsync._replace = crash
+ghsync.run_sync(argparse.Namespace(dir=root, message=None, dry_run=False, yes=True, prefer=None,
+                                   resolve=None, only=None), "sync")
+"""
+
+
+class TestGHS009TempOwnership(Base):
+    USER_FILES = {
+        "notes.ghsync-tmp": "my notes",
+        "sub/data.ghsync-tmp": "my data",
+        ".ghs-abcdef123456.ghsync-tmp": "looks like a 0.2.0 temp name",
+        ".ghsync-0123456789abcdef-1.ghsync-tmp": "looks like a temp from a run ghsync never journaled",
+    }
+
+    def _temps(self):
+        return sorted(os.path.relpath(os.path.join(d, f), self.root).replace(os.sep, "/")
+                      for d, _, fs in os.walk(self.root) for f in fs if f.endswith(".ghsync-tmp"))
+
+    def test_user_files_with_reserved_suffix_survive_full_sync(self):
+        self.synced({"a.txt": "a", "sub/b.txt": "b"})
+        for rel, data in self.USER_FILES.items():
+            self.write(rel, data)
+        inside = os.path.join(self.root, ".ghsync", "mine.ghsync-tmp")
+        with open(inside, "w") as f:
+            f.write("user file inside .ghsync")
+        self.gh.commit_files({"sub/b.txt": b"remote", "new.txt": b"n"}, keep=True)   # forces a pull
+        self.write("a.txt", "local")                                               # and a push
         self.sync()
-        tmp = [f for d, _, fs in os.walk(self.root) for f in fs if f.endswith(".ghsync-tmp")]
-        self.assertEqual(tmp, [])
+        self.sync()
+        for rel, data in self.USER_FILES.items():
+            self.assertTrue(self.exists(rel), f"{rel} was deleted")
+            self.assertEqual(self.read(rel), data.encode())
+        self.assertTrue(os.path.exists(inside))
+        self.assertEqual(self.read("sub/b.txt"), b"remote")
+        self.assertEqual(self.gh.files()["a.txt"], b"local")
+        for rel in self.USER_FILES:
+            self.assertNotIn(rel, self.gh.files())   # the suffix stays reserved: never synced
+
+    def test_hard_crash_mid_pull_leaves_temp_that_next_run_removes(self):
+        self.synced({"a.txt": "a"})
+        self.write("notes.ghsync-tmp", "mine")
+        self.gh.commit_files({"x.txt": b"remote file"}, keep=True)
+        from fake_github import serve_http
+        srv, url = serve_http(self.gh)
+        self.gh._mod = None
+        try:
+            env = dict(os.environ, GHSYNC_API=url, GITHUB_TOKEN="t")
+            r = subprocess.run([sys.executable, "-I", "-c", CRASH_CHILD, SRC, self.root],
+                               env=env, capture_output=True, text=True, timeout=60)
+        finally:
+            srv.shutdown()
+            self.gh._mod = ghsync
+        self.assertEqual(r.returncode, 9, r.stderr)
+        leftovers = [t for t in self._temps() if t != "notes.ghsync-tmp"]
+        self.assertEqual(len(leftovers), 1, self._temps())   # the crashed run's temp file
+        self.assertFalse(self.exists("x.txt"))
+        self.sync()                                          # restart recovery
+        self.assertEqual(self._temps(), ["notes.ghsync-tmp"])
+        self.assertEqual(self.read("x.txt"), b"remote file")
+        self.assertEqual(self.read("notes.ghsync-tmp"), b"mine")
+
+    def test_damaged_journal_never_causes_deletion(self):
+        self.synced({"a.txt": "a"})
+        name = ".ghsync-0123456789abcdef-1.ghsync-tmp"
+        self.write(name, "mine")
+        with open(os.path.join(self.root, ".ghsync", "journal.json"), "w") as f:
+            f.write('{"pending_runs": ["0123456789ab')
+        self.gh.commit_files({"x.txt": b"x"}, keep=True)
+        self.sync()
+        self.assertEqual(self.read(name), b"mine")
+        self.assertEqual(self.read("x.txt"), b"x")
+
+    def test_remote_cannot_plant_a_tool_temp_name(self):
+        self.synced({"a.txt": "a"})
+        self.gh.commit_files({".ghsync-0123456789abcdef-1.ghsync-tmp": b"x"}, keep=True)
+        self.sync()
+        self.assertFalse(self.exists(".ghsync-0123456789abcdef-1.ghsync-tmp"))
 
 
 # ================================ GHS-007: approval is bound to the executed plan
@@ -575,6 +658,65 @@ class TestWindowsLinks(Base):
         self.sync()
         self.assertEqual(self.read("run.sh"), b"echo 2")
         self.assertTrue(os.stat(self.path("run.sh")).st_mode & 0o100)
+
+
+@unittest.skipUnless(sys.platform == "win32", "real NTFS junctions (Windows only)")
+class TestRealWindowsJunctions(Base):
+    """Same scenarios as TestWindowsLinks, but with real junctions made by mklink /J."""
+
+    def setUp(self):
+        super().setUp()
+        self._junctions = []
+
+    def tearDown(self):
+        for link in self._junctions:      # unlink junctions before the temp folder is removed,
+            if os.path.lexists(link):     # so cleanup can never reach through one
+                os.rmdir(link)
+        super().tearDown()
+
+    def junction(self, rel, target):
+        link = self.path(rel)
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", link, target], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self._junctions.append(link)
+        st = os.lstat(link)
+        self.assertTrue(ghsync._is_link_like(st), "lstat did not report the junction as a link")
+        return link
+
+    def test_pull_through_junction_does_not_escape(self):
+        self.synced({"a.txt": "a"})
+        self.junction("linked", self.outside)
+        self.gh.commit_files({"linked/outside.txt": b"pwned"}, keep=True)
+        self.sync()
+        self.assertFalse(os.path.exists(os.path.join(self.outside, "outside.txt")))
+
+    def test_junction_contents_are_not_pushed(self):
+        with open(os.path.join(self.outside, "secret.txt"), "w") as f:
+            f.write("outside the project")
+        self.synced({"a.txt": "a"})
+        self.junction("linked", self.outside)
+        out = self.sync()
+        self.assertNotIn("linked/secret.txt", self.gh.files())
+        self.assertIn("symlink or junction", out)
+
+    def test_remote_delete_through_junction_is_refused(self):
+        victim = os.path.join(self.outside, "x.txt")
+        self.synced({"a.txt": "a", "d/x.txt": "keep me"})
+        shutil.rmtree(self.path("d"))
+        with open(victim, "w") as f:
+            f.write("keep me")
+        self.junction("d", self.outside)
+        self.gh.commit_files({"d/x.txt": None}, keep=True)
+        self.sync()
+        self.assertTrue(os.path.exists(victim))
+
+    def test_file_behind_junction_is_not_deleted_from_github(self):
+        self.synced({"a.txt": "a", "d/x.txt": "x"})
+        shutil.rmtree(self.path("d"))
+        self.junction("d", self.outside)
+        self.sync()
+        self.assertIn("d/x.txt", self.gh.files())
 
 
 class TestCliOverHttp(Base):

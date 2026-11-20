@@ -59,7 +59,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 API = os.environ.get("GHSYNC_API", "https://api.github.com")
 STATE_DIR = ".ghsync"
@@ -78,6 +78,12 @@ _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _REPARSE_POINT = 0x400            # FILE_ATTRIBUTE_REPARSE_POINT
 _NAME_SURROGATE = 0x20000000      # reparse tags that redirect a path (symlinks, junctions, mounts)
 _TEMP_REASON = "ghsync temporary file"
+# Temp files ghsync creates next to project files. The run id is written to
+# .ghsync/journal.json *before* any such file exists, and cleanup only deletes exact
+# matches whose run id is in the journal. A name alone never proves ownership.
+_RUN_TEMP_RE = re.compile(r"^\.ghsync-([0-9a-f]{16})-([0-9]{1,9})\.ghsync-tmp$")
+# Temp files for ghsync's own JSON files, only ever inside the reserved .ghsync/ folder.
+_STATE_TEMP_RE = re.compile(r"^\.tmp-[0-9a-f]{12}\.ghsync-tmp$")
 
 
 class ApiError(Exception):
@@ -208,7 +214,7 @@ def check_repo_path(rel):
         if part.casefold() in _RESERVED_DIRS:
             return f"'{part}/' is reserved"
         if part.endswith(TMP_SUFFIX):
-            return _TEMP_REASON
+            return "the .ghsync-tmp suffix is reserved"
     return None
 
 
@@ -484,8 +490,8 @@ def scan_local(root):
                 excluded[rel] = f"can't be read ({e.strerror or e})"
                 continue
             is_dir = stat.S_ISDIR(st.st_mode)
-            if name.endswith(TMP_SUFFIX) and stat.S_ISREG(st.st_mode) and not _is_link_like(st):
-                excluded[rel] = _TEMP_REASON
+            if _RUN_TEMP_RE.match(name) and stat.S_ISREG(st.st_mode) and not _is_link_like(st):
+                excluded[rel] = _TEMP_REASON     # a candidate only; see cleanup_temps()
                 continue
             if ignored(rel, is_dir, pats):
                 continue
@@ -568,12 +574,14 @@ def _check_expected(target, rel, expect):
         raise LocalChanged(f"{rel} changed locally during the sync; skipped (your edit is kept)")
 
 
-def write_local(root, rel, data, expect):
+def write_local(root, rel, data, expect, temp_name=None):
     """Replace root/rel with data, only if the current file still matches `expect`.
 
     Never writes outside root: parents are verified before the temp file is created and
     again immediately before the rename, and the rename replaces a final symlink rather
-    than following it.
+    than following it. `temp_name` comes from a journaled RunTemps; without one the temp
+    gets a fresh run id that is not journaled, so a hard crash would leave it in place
+    (held, never deleted) rather than risk deleting anything ghsync can't prove it made.
     """
     why = check_repo_path(rel)
     if why:
@@ -586,7 +594,7 @@ def write_local(root, rel, data, expect):
             raise LocalChanged(f"{rel} was removed locally during the sync; skipped") from None
     parent = _check_parents(root, rel, create=True)
     target = os.path.join(parent, rel.rsplit("/", 1)[-1])
-    tmp = os.path.join(parent, f".ghs-{secrets.token_hex(6)}{TMP_SUFFIX}")
+    tmp = os.path.join(parent, temp_name or RunTemps(secrets.token_hex(8)).next_name())
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY | _O_NOFOLLOW, 0o666)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -642,24 +650,77 @@ def read_local(root, rel):
         return f.read()
 
 
-def _remove_temp(root, rel):
-    with contextlib.suppress(OSError, GhsyncError):
+class RunTemps:
+    """Names for the temp files of one pull: .ghsync-<run id>-<n>.ghsync-tmp"""
+
+    def __init__(self, run_id):
+        self.run_id = run_id
+        self._n = 0
+        self._mu = threading.Lock()
+
+    def next_name(self):
+        with self._mu:
+            self._n += 1
+            return f".ghsync-{self.run_id}-{self._n}{TMP_SUFFIX}"
+
+
+def _journal_path(root):
+    return os.path.join(root, STATE_DIR, "journal.json")
+
+
+def journal_runs(root):
+    """Run ids that may have left temp files. A damaged journal reads as empty: when in
+    doubt ghsync leaves files alone rather than delete something it can't prove it made."""
+    j = read_json(_journal_path(root), {})
+    runs = j.get("pending_runs") if isinstance(j, dict) else None
+    if not isinstance(runs, list):
+        return []
+    return [r for r in runs if isinstance(r, str) and re.fullmatch(r"[0-9a-f]{16}", r)]
+
+
+def _journal_set(root, runs):
+    write_json(_journal_path(root), {"pending_runs": sorted(set(runs))})
+
+
+def _remove_owned(root, rel, pattern):
+    """Delete root/rel only if it is a regular file whose name matches `pattern` exactly."""
+    try:
+        if not pattern.match(rel.rsplit("/", 1)[-1]):
+            return True
         parent = _check_parents(root, rel, create=False)
         target = os.path.join(parent, rel.rsplit("/", 1)[-1])
         st = os.lstat(target)
-        if stat.S_ISREG(st.st_mode) and not _is_link_like(st) and target.endswith(TMP_SUFFIX):
+        if stat.S_ISREG(st.st_mode) and not _is_link_like(st):
             os.remove(target)
+        return True
+    except FileNotFoundError:
+        return True
+    except (OSError, GhsyncError):
+        return False
 
 
 def cleanup_temps(root, temps):
-    """Remove temp files left by an interrupted run. Caller must hold the project lock."""
-    for rel in temps:
-        _remove_temp(root, rel)
+    """Remove temp files left by a run that was interrupted. Caller must hold the lock.
+
+    Deletes a file only if its name is exactly .ghsync-<run id>-<n>.ghsync-tmp and that
+    run id is in .ghsync/journal.json, i.e. ghsync recorded the run before creating it.
+    Any other *.ghsync-tmp file is user data and is left alone. Inside the reserved
+    .ghsync/ folder, only ghsync's own .tmp-<12 hex>.ghsync-tmp names are removed.
+    """
+    runs = set(journal_runs(root))
+    if runs:
+        failed = set()
+        for rel in temps:
+            m = _RUN_TEMP_RE.match(rel.rsplit("/", 1)[-1])
+            if m and m.group(1) in runs and not _remove_owned(root, rel, _RUN_TEMP_RE):
+                failed.add(m.group(1))
+        with contextlib.suppress(OSError):
+            _journal_set(root, failed)      # runs fully cleaned are forgotten
     sd = os.path.join(root, STATE_DIR)
     with contextlib.suppress(OSError):
         for name in os.listdir(sd):
-            if name.endswith(TMP_SUFFIX):
-                _remove_temp(root, STATE_DIR + "/" + name)
+            if _STATE_TEMP_RE.match(name):
+                _remove_owned(root, STATE_DIR + "/" + name, _STATE_TEMP_RE)
 
 
 # ------------------------------------------------------------ remote helpers
@@ -933,7 +994,7 @@ def do_push(root, cfg, items, remote, message):
     return commit["sha"]
 
 
-def do_pull(root, cfg, items, local):
+def do_pull(root, cfg, items, local, temps=None):
     """Apply remote changes one file at a time.
 
     Returns (done, failed): done = {path: sha or None} actually applied, failed =
@@ -956,7 +1017,8 @@ def do_pull(root, cfg, items, local):
             data = api("GET", repo_api(cfg, f"/git/blobs/{sha}"), raw=True)
             if blob_sha_bytes(data) != sha:
                 raise GhsyncError(f"download of {p} failed hash check")
-            write_local(root, p, data, expect=local.get(p))
+            write_local(root, p, data, expect=local.get(p),
+                        temp_name=temps.next_name() if temps else None)
             return p, sha, None
         except Exception as e:  # noqa: BLE001 - one bad file must not abort the rest
             return p, sha, (str(e) if isinstance(e, (GhsyncError, OSError))
@@ -1135,7 +1197,11 @@ def _run_sync_locked(args, mode, root, cfg):
     done_pull, failed = {}, {}
     if pull:
         print("\nPulling...")
-        done_pull, failed = do_pull(root, cfg, pull, snap["local"])
+        temps = RunTemps(secrets.token_hex(8))
+        _journal_set(root, journal_runs(root) + [temps.run_id])   # before any temp exists
+        done_pull, failed = do_pull(root, cfg, pull, snap["local"], temps)
+        # Every temp of this run was renamed into place or removed by write_local.
+        _journal_set(root, [r for r in journal_runs(root) if r != temps.run_id])
         # Record what the pull achieved before pushing, so an interrupted push loses nothing.
         write_json(state_path, {"commit": remote["commit"], "files": next_base(snap, {}, done_pull)})
     done_push = {}
