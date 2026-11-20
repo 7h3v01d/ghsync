@@ -75,6 +75,10 @@ class Base(unittest.TestCase):
             ghsync.run_sync(self.ns(**kw), mode)
         return buf.getvalue()
 
+    def config(self):
+        with open(os.path.join(self.root, ".ghsync", "config.json"), encoding="utf-8") as f:
+            return json.load(f)
+
     def state(self):
         with open(os.path.join(self.root, ".ghsync", "state.json"), encoding="utf-8") as f:
             return json.load(f)
@@ -149,7 +153,7 @@ class TestGHS001RemotePathPolicy(Base):
         evil = json.dumps({"owner": "attacker", "repo": "x", "branch": "main"}).encode()
         self.gh.commit_files({".ghsync/config.json": evil, ".ghsync/state.json": b"{}"}, keep=True)
         self.sync()
-        cfg = json.load(open(os.path.join(self.root, ".ghsync", "config.json"), encoding="utf-8"))
+        cfg = self.config()
         self.assertEqual(cfg["owner"], "me")
 
     def test_remote_ignored_files_are_not_pulled(self):
@@ -172,8 +176,12 @@ class TestGHS001RemotePathPolicy(Base):
         self.gh.commit_files({"CON.txt": b"x", "a:b.txt": b"x", "trail.": b"x", "back\\slash": b"x"},
                              keep=True)
         self.sync()
+        # Check the real directory listing: on Windows, os.path.exists("<any folder>\\CON.txt")
+        # is True because the name refers to the console device, file or no file.
+        on_disk = set(os.listdir(self.root))
         for name in ("CON.txt", "a:b.txt", "trail.", "back\\slash"):
-            self.assertFalse(os.path.lexists(os.path.join(self.root, name)), name)
+            self.assertNotIn(name, on_disk)
+        self.assertEqual(set(os.listdir(self.root)), {".ghsync", "normal.txt"})
 
     def test_remote_symlink_is_not_materialised_as_a_file(self):
         self.synced({"normal.txt": "n"})
@@ -186,7 +194,7 @@ class TestGHS001RemotePathPolicy(Base):
         self.gh.commit_files({".ghsync/config.json": b'{"owner":"attacker","repo":"x","branch":"main"}'},
                              keep=True)
         self.sync(resolve={".ghsync/config.json": "remote"}, only={".ghsync/config.json"})
-        cfg = json.load(open(os.path.join(self.root, ".ghsync", "config.json"), encoding="utf-8"))
+        cfg = self.config()
         self.assertEqual(cfg["owner"], "me")
 
     def test_unsafe_remote_paths_never_deleted_remotely_either(self):
@@ -398,6 +406,7 @@ class TestGHS005Lock(Base):
         finally:
             proc.stdin.close()
             proc.wait(10)
+            proc.stdout.close()
 
     def test_lock_is_released_when_holder_dies(self):
         self.synced({"a.txt": "a"})
@@ -405,6 +414,8 @@ class TestGHS005Lock(Base):
         proc = self._hold()
         proc.kill()
         proc.wait(10)
+        proc.stdin.close()
+        proc.stdout.close()
         self.sync()
         self.assertEqual(self.gh.files()["a.txt"], b"changed")
 
@@ -537,6 +548,7 @@ class TestGHS009TempOwnership(Base):
                                env=env, capture_output=True, text=True, timeout=60)
         finally:
             srv.shutdown()
+            srv.server_close()
             self.gh._mod = ghsync
         self.assertEqual(r.returncode, 9, r.stderr)
         leftovers = [t for t in self._temps() if t != "notes.ghsync-tmp"]
@@ -595,6 +607,84 @@ class TestGHS007PlanBinding(Base):
         digest = self._digest()
         self.sync(expect=digest)
         self.assertNotIn("b.txt", self.gh.files())
+
+
+# ============================ 0.2.2: .gitignore and .packagerignore are always honoured
+class TestIgnoreFiles(Base):
+    def test_gitignore_applies_even_when_ghignore_exists(self):
+        self.write(".ghignore", "*.log\n")
+        self.write(".gitignore", "build/\n")
+        self.write("a.txt", "a")
+        self.write("app.log", "log")
+        self.write("build/out.bin", "bin")
+        self.sync()
+        self.assertEqual(set(self.gh.files()), {"a.txt", ".ghignore", ".gitignore"})
+
+    def test_packagerignore_is_honoured(self):
+        self.write(".packagerignore", "# Internal review notes\ndocs/internal/\n")
+        self.write("docs/guide.md", "public")
+        self.write("docs/internal/review.md", "private")
+        self.sync()
+        self.assertIn("docs/guide.md", self.gh.files())
+        self.assertNotIn("docs/internal/review.md", self.gh.files())
+
+    def test_all_three_files_apply_together(self):
+        self.write(".ghignore", "a.tmp\n")
+        self.write(".gitignore", "b.tmp\n")
+        self.write(".packagerignore", "c.tmp\n")
+        for n in ("a.tmp", "b.tmp", "c.tmp", "keep.txt"):
+            self.write(n, n)
+        self.sync()
+        self.assertEqual({p for p in self.gh.files() if not p.startswith(".")}, {"keep.txt"})
+
+    def test_packagerignore_force_include_does_not_unignore(self):
+        self.write(".gitignore", "secrets/\n")
+        self.write(".packagerignore", "!secrets/keep.txt\n!.env\n")
+        self.write("secrets/keep.txt", "s")
+        self.write(".env", "TOKEN=1")
+        self.sync()
+        self.assertNotIn("secrets/keep.txt", self.gh.files())
+        self.assertNotIn(".env", self.gh.files())
+
+    def test_remote_files_matching_packagerignore_are_not_pulled(self):
+        self.synced({"a.txt": "a", ".packagerignore": "docs/internal/\n"})
+        self.gh.commit_files({"docs/internal/notes.md": b"from github"}, keep=True)
+        self.sync()
+        self.assertFalse(self.exists("docs/internal/notes.md"))
+
+    def test_newly_packagerignored_file_is_not_deleted_from_github(self):
+        self.synced({"a.txt": "a", "docs/internal/notes.md": "n"})
+        self.write(".packagerignore", "docs/internal/\n")
+        self.sync()
+        self.assertIn("docs/internal/notes.md", self.gh.files())
+        self.assertTrue(self.exists("docs/internal/notes.md"))
+
+    def test_bom_crlf_and_escaped_bang(self):
+        with open(self.path(".packagerignore"), "wb") as f:
+            f.write(b"\xef\xbb\xbfprivate.txt\r\n\\!weird.txt\r\n")
+        self.write("private.txt", "p")
+        self.write("!weird.txt", "w")
+        self.write("ok.txt", "o")
+        self.sync()
+        self.assertNotIn("private.txt", self.gh.files())
+        self.assertNotIn("!weird.txt", self.gh.files())
+        self.assertIn("ok.txt", self.gh.files())
+
+    def test_unreadable_packagerignore_fails_closed(self):
+        self.write("a.txt", "a")
+        self.write("docs/internal/review.md", "private")
+        with open(self.path(".packagerignore"), "wb") as f:
+            f.write(b"docs/intern\xffal/\n")
+        out = self.assert_fails(lambda: ghsync.run_sync(self.ns(), "sync"))
+        self.assertNotIn("docs/internal/review.md", self.gh.files())
+        self.assertIn(".packagerignore", out)
+
+    def test_status_names_the_active_ignore_files(self):
+        self.synced({"a.txt": "a", ".gitignore": "x\n", ".packagerignore": "y\n"})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ghsync.cmd_status(argparse.Namespace(dir=self.root))
+        self.assertIn("Ignore rules: .gitignore, .packagerignore", buf.getvalue())
 
 
 # ================================== extra findings from verification (not in review)
@@ -731,6 +821,7 @@ class TestCliOverHttp(Base):
 
     def tearDown(self):
         self.srv.shutdown()
+        self.srv.server_close()
         super().tearDown()
 
     def cli(self, *argv):

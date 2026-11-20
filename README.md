@@ -149,9 +149,17 @@ To unlink a folder, delete its `.ghsync/` directory. To sign out, delete `~/.ghs
 
 Skipped by default: `.git/`, `.ghsync/`, `node_modules/`, `__pycache__/`, `*.pyc`, `.DS_Store`, `Thumbs.db`, `desktop.ini`, `.env`, `.venv/`, `venv/`, `*.ghsync-tmp`. That last suffix is reserved: files ending in it are never synced, but ghsync never deletes them either unless it created them itself.
 
-Add your own in a `.ghignore` file in the project root. If there is no `.ghignore`, an existing `.gitignore` is used instead.
+ghsync honours **all** of these ignore files in the project root, each read on its own:
 
-The matching is a **subset** of `.gitignore` syntax: `name`, `*.ext`, `dir/`, `/anchored` and `path/with/slash` globs. Negation (`!pattern`) lines are skipped, and `**` is treated as an ordinary `*`. If you rely on fuller `.gitignore` behaviour, write a `.ghignore` that spells out what you mean.
+| File | Typically written for |
+|---|---|
+| `.ghignore` | ghsync only |
+| `.gitignore` | git, and any tool that follows it |
+| `.packagerignore` | Project Packager (e.g. `docs/internal/` review notes that shouldn't ship) |
+
+A path matched by **any** of them is not synced, in either direction. ghsync only reads these files; it never writes to them or combines them, so each tool keeps its own. If one of them exists but can't be read (not valid UTF-8, a link, permission denied), the sync stops instead of going ahead without those exclusions. A UTF-8 BOM and Windows line endings are fine. `status` shows which files are in effect.
+
+The matching is a **subset** of `.gitignore` syntax: `name`, `*.ext`, `dir/`, `/anchored` and `path/with/slash` globs. Negation / force-include (`!pattern`) lines are skipped: ghsync never un-ignores, because that could upload something another tool was told to keep out (`\!name` still means a literal `!name`). `**` is treated as an ordinary `*`, and only the ignore files in the project root are read, not ones in subfolders. If you rely on fuller `.gitignore` behaviour, write a `.ghignore` that spells out what you mean.
 
 Ignore rules apply to both sides. Ignoring a file that was already synced does **not** delete it from GitHub; it just stops being synced. Delete it on GitHub yourself if you want it gone.
 
@@ -169,7 +177,7 @@ Ignore rules apply to both sides. Ignoring a file that was already synced does *
 
 ## Status
 
-0.2.1, "Safe Sync". 0.2 fixed the filesystem-safety, concurrency and recovery findings from an independent review (GHS-001 to GHS-008); 0.2.1 fixes the one defect found in the follow-up review (GHS-009: temp cleanup could delete user files ending in `.ghsync-tmp`). No new features.
+0.2.2: `.gitignore` and `.packagerignore` are now always honoured alongside `.ghignore` (previously `.gitignore` was only used when there was no `.ghignore`). 0.2.1, "Safe Sync". 0.2 fixed the filesystem-safety, concurrency and recovery findings from an independent review (GHS-001 to GHS-008); 0.2.1 fixes the one defect found in the follow-up review (GHS-009: temp cleanup could delete user files ending in `.ghsync-tmp`). No new features.
 
 The regression suite in `tests/` runs against an in-memory GitHub, over real HTTP for the CLI, and drives the real GUI offscreen. Every fix has a test that fails on the build before it and passes on 0.2.1. On Windows the suite also creates real NTFS junctions (`mklink /J`, no admin rights needed) and uses the real `msvcrt` lock.
 
