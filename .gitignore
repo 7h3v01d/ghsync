@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Local state — NEVER commit these
+.env
+.env.*
+*.token
+*.key
+*.pem
+
+# Paranoid secret/credential file ignores
+token.txt
+tokens.txt
+*.secret
+*.secrets
+*.pat
+*.credentials
+credentials.*
+auth.txt
+secrets.txt
+*.auth
+
+# App generated files
+~/.gh_manager_settings.json
+~/.gh_manager_audit.jsonl
+exports/
+*.csv
+*.zip
+
+# Local cloned repos directory
+github-manager-repos/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Test artefacts
+.pytest_cache/
+.old/
+.backup/
