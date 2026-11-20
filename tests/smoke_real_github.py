@@ -1,0 +1,163 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Leon Priest (GitHub: 7h3v01d)
+"""
+Smoke test against the REAL GitHub API, using a disposable repository.
+
+  set GITHUB_TOKEN=...                       (or run `python ghsync.py login` first)
+  python tests\\smoke_real_github.py owner/throwaway-repo --i-understand owner/throwaway-repo
+
+The repository must already exist with at least one commit (create it on github.com
+with "Add a README"). The test adds, changes and deletes files under smoke/ in that
+repo and leaves a few commits behind. Never point it at a repo you care about.
+
+Exit code 0 = every step passed.
+"""
+import argparse
+import base64
+import contextlib
+import io
+import os
+import shutil
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import ghsync  # noqa: E402
+
+RESULTS = []
+
+
+def step(name, ok, detail=""):
+    RESULTS.append(ok)
+    print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f"  ({detail})" if detail and not ok else ""))
+
+
+def quiet(fn, *a):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        return fn(*a), buf.getvalue()
+
+
+def remote_commit(cfg, files, message):
+    """Change the repo behind ghsync's back, like an edit on github.com would."""
+    head = ghsync.remote_head(cfg)
+    tree = ghsync.api("GET", ghsync.repo_api(cfg, f"/git/commits/{head}"))["tree"]["sha"]
+    entries = []
+    for p, data in files.items():
+        if data is None:
+            entries.append({"path": p, "mode": "100644", "type": "blob", "sha": None})
+        else:
+            sha = ghsync.api("POST", ghsync.repo_api(cfg, "/git/blobs"),
+                             {"content": base64.b64encode(data).decode(), "encoding": "base64"})["sha"]
+            entries.append({"path": p, "mode": "100644", "type": "blob", "sha": sha})
+    t = ghsync.api("POST", ghsync.repo_api(cfg, "/git/trees"), {"base_tree": tree, "tree": entries})["sha"]
+    c = ghsync.api("POST", ghsync.repo_api(cfg, "/git/commits"), {"message": message, "tree": t, "parents": [head]})
+    ghsync.api("PATCH", ghsync.ref_api(cfg, single=False), {"sha": c["sha"]})
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("repo")
+    ap.add_argument("--i-understand", required=True, metavar="OWNER/REPO",
+                    help="repeat the repo name to confirm it may be modified")
+    a = ap.parse_args()
+    if a.repo != a.i_understand:
+        sys.exit("repo names don't match; refusing")
+    owner, repo = a.repo.split("/", 1)
+    info = ghsync.api("GET", ghsync.repo_api({"owner": owner, "repo": repo}))
+    cfg = {"owner": owner, "repo": repo, "branch": info["default_branch"]}
+
+    tmp = tempfile.mkdtemp(prefix="ghsync-smoke-")
+    root = os.path.join(tmp, "proj")
+    os.makedirs(root)
+    ghsync.save_cfg(root, **cfg)
+    ns = argparse.Namespace(dir=root, message=None, dry_run=False, yes=True, prefer=None,
+                            resolve=None, only=None)
+    stamp = time.strftime("%H%M%S")
+
+    def path(rel):
+        return os.path.join(root, *rel.split("/"))
+
+    def write(rel, data):
+        os.makedirs(os.path.dirname(path(rel)), exist_ok=True)
+        with open(path(rel), "wb") as f:
+            f.write(data)
+
+    def remote_files():
+        return ghsync.fetch_remote(cfg)["files"]
+
+    try:
+        # 1. adopt the repo (pull whatever is there), then push new files
+        quiet(ghsync.run_sync, ns, "sync")
+        write("smoke/a.txt", f"a {stamp}".encode())
+        write("smoke/sub/b.txt", f"b {stamp}".encode())
+        write("smoke/big-but-ok.bin", os.urandom(300_000))
+        quiet(ghsync.run_sync, ns, "sync")
+        rf = remote_files()
+        step("push adds files", all(p in rf for p in ("smoke/a.txt", "smoke/sub/b.txt", "smoke/big-but-ok.bin")))
+
+        # 2. remote edit + remote delete -> pull
+        remote_commit(cfg, {"smoke/a.txt": b"edited on github", "smoke/sub/b.txt": None}, "smoke: remote edit")
+        quiet(ghsync.run_sync, ns, "sync")
+        step("pull applies remote edit", open(path("smoke/a.txt"), "rb").read() == b"edited on github")
+        step("pull applies remote delete", not os.path.exists(path("smoke/sub/b.txt")))
+
+        # 3. local delete -> push
+        os.remove(path("smoke/big-but-ok.bin"))
+        quiet(ghsync.run_sync, ns, "sync")
+        step("push deletes remotely", "smoke/big-but-ok.bin" not in remote_files())
+
+        # 4. conflict is left alone, then resolved
+        write("smoke/a.txt", b"local side")
+        remote_commit(cfg, {"smoke/a.txt": b"remote side"}, "smoke: conflict")
+        _, out = quiet(ghsync.run_sync, ns, "sync")
+        step("conflict reported and untouched",
+             "CONFLICT" in out and open(path("smoke/a.txt"), "rb").read() == b"local side")
+        quiet(ghsync.run_sync, argparse.Namespace(**{**vars(ns), "prefer": "local"}), "sync")
+        rf = remote_files()
+        blob = ghsync.api("GET", ghsync.repo_api(cfg, f"/git/blobs/{rf['smoke/a.txt']}"), raw=True)
+        step("conflict resolved with --prefer local", blob == b"local side")
+
+        # 5. reserved / ignored remote paths are never written locally
+        remote_commit(cfg, {"smoke/.env": b"SECRET=1", ".ghsync/config.json": b'{"owner":"x"}'},
+                      "smoke: hostile paths")
+        quiet(ghsync.run_sync, ns, "sync")
+        cfg_now = ghsync.read_json(os.path.join(root, ".ghsync", "config.json"), {})
+        step("remote .ghsync/ ignored", cfg_now.get("owner") == owner)
+        step("remote ignored file not pulled", not os.path.exists(path("smoke/.env")))
+
+        # 6. newly ignored file is not deleted from GitHub
+        write("smoke/keep.txt", b"keep")
+        quiet(ghsync.run_sync, ns, "sync")
+        with open(path(".ghignore"), "w") as f:
+            f.write("smoke/keep.txt\n.ghignore\n")
+        quiet(ghsync.run_sync, ns, "sync")
+        step("newly ignored file kept on GitHub", "smoke/keep.txt" in remote_files())
+        os.remove(path(".ghignore"))
+
+        # 7. lock: a second operation is refused while one holds the folder
+        with ghsync.ProjectLock(root):
+            import subprocess
+            r = subprocess.run([sys.executable, os.path.join(os.path.dirname(ghsync.__file__), "ghsync.py"),
+                                "-C", root, "sync", "--yes"], capture_output=True, text=True, timeout=120)
+        step("concurrent run refused", r.returncode != 0 and "another ghsync" in r.stderr, r.stderr.strip())
+
+        # 8. restart after a fresh state file: nothing gets deleted
+        os.remove(os.path.join(root, ".ghsync", "state.json"))
+        before = remote_files()
+        quiet(ghsync.run_sync, ns, "sync")
+        step("re-baseline deletes nothing", set(before) <= set(remote_files()))
+
+        # clean up what the smoke test added
+        remote_commit(cfg, {p: None for p in remote_files() if p.startswith(("smoke/", ".ghsync/"))},
+                      "smoke: cleanup")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print(f"\n{sum(RESULTS)}/{len(RESULTS)} steps passed")
+    sys.exit(0 if all(RESULTS) else 1)
+
+
+if __name__ == "__main__":
+    main()

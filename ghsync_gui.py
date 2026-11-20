@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) Leon Priest (GitHub: 7h3v01d)
 """
 ghsync_gui - dark industrial GUI for ghsync.py.
 
@@ -197,10 +199,17 @@ class Worker(QThread):
 
 def compute_plan(root):
     root, cfg = ghsync.load_cfg(argparse.Namespace(dir=root))
-    base, local, remote, skipped = ghsync.gather(root, cfg)
-    push, pull, conflict, same = ghsync.classify(base, local, remote["files"])
-    return dict(cfg=cfg, base=base, local=local, remote=remote, push=push, pull=pull,
-                conflict=conflict, same=len(same), skipped=skipped)
+    snap = ghsync.gather(root, cfg)
+    push, pull, conflict, same = ghsync.plan_actions(snap, "sync")
+    return dict(cfg=cfg, snap=snap, base=snap["base"], local=snap["local"], remote=snap["remote"],
+                push=push, pull=pull, conflict=conflict, same=len(same),
+                held=ghsync.held_to_show(snap))
+
+
+def bound_actions(plan, mode, only=None, resolve=None):
+    """What a run would execute from this plan, plus the digest that binds the run to it."""
+    push, pull, _, _ = ghsync.plan_actions(plan["snap"], mode, only=only, resolve=resolve)
+    return push, pull, ghsync.plan_digest(mode, push, pull)
 
 
 class WatchWorker(QThread):
@@ -271,6 +280,7 @@ class Main(QMainWindow):
         self.last_local = None
         self.local_dirty = False
         self.last_sig = None
+        self.last_held = None
         self.tick_n = 0
         self.tray_state = "unknown"
         self._quitting = False
@@ -471,8 +481,9 @@ class Main(QMainWindow):
         self.token_card = self._card()
         tl = self.token_card.layout()
         tl.addWidget(caption("01   GITHUB TOKEN"))
-        hint = QLabel("Create a <b>classic</b> token with the <b>repo</b> scope at "
-                      "github.com/settings/tokens. It is stored in your user folder.")
+        hint = QLabel("Create a <b>fine-grained</b> token at github.com/settings/tokens with "
+                      "<b>Contents: read and write</b> on the repos you sync (add <b>Administration: "
+                      "write</b> only if you want to create repos from here). It is stored in your user folder.")
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color:{MUTED};")
         tl.addWidget(hint)
@@ -615,7 +626,7 @@ class Main(QMainWindow):
         self._workers.add(w)
         w.out.connect(self.log_write)
         w.result.connect(lambda res: self._job_ok(res, on_ok, then_refresh))
-        w.failed.connect(self._job_failed)
+        w.failed.connect(lambda msg: self._job_failed(msg, then_refresh))
         w.finished.connect(lambda: self._workers.discard(w))
         w.start()
 
@@ -627,13 +638,15 @@ class Main(QMainWindow):
         if then_refresh:
             self.refresh()
 
-    def _job_failed(self, msg):
+    def _job_failed(self, msg, then_refresh=False):
         self.set_busy(False)
         if msg:
             self.log_write(msg + "\n", "err")
         self.set_status("Failed - see log", RED)
         if self.stack.currentIndex() == 1:
             self.tabs.setCurrentIndex(0)
+        if then_refresh:          # e.g. the plan changed after confirmation: show the new one
+            self.refresh()
 
     # ---- folder / state
     def browse(self):
@@ -732,29 +745,44 @@ class Main(QMainWindow):
         else:
             self.empty.setText("ALL CLEAR  -  FOLDER AND REPO MATCH")
             self.tstack.setCurrentIndex(1)
-        if plan["skipped"]:
-            self.set_status(f"{len(plan['skipped'])} file(s) over 100 MB skipped (GitHub limit)", AMBER)
+        held = plan["held"]
+        if held:
+            self.set_status(f"{len(held)} file(s) held back, not synced - see log", AMBER)
+            sig = tuple(sorted(held.items()))
+            if sig != self.last_held:
+                self.last_held = sig
+                self.log_write(f"\n[held] {len(held)} file(s) are not synced and will never be deleted:\n", "mark")
+                for p, why in sorted(held.items())[:200]:
+                    self.log_write(f"  {p}  -  {why}\n")
+        else:
+            self.last_held = None
         self.update_buttons()
         self.update_tray()
         self.after_plan(notify)
 
     # ---- actions
-    def confirm_deletes(self, mode):
-        if not self.plan:
-            return True
-        dl = sum(v is None for v in self.plan["pull"].values()) if mode in ("pull", "sync") else 0
-        dr = sum(v is None for v in self.plan["push"].values()) if mode in ("push", "sync") else 0
+    def confirm_deletes(self, push, pull):
+        dl = sorted(p for p, v in pull.items() if v is None)
+        dr = sorted(p for p, v in push.items() if v is None)
         if not (dl or dr):
             return True
-        text = (f"This will delete {dl} file(s) from this folder and {dr} file(s) from GitHub.\n\nContinue?")
+        names = [f"  local:  {p}" for p in dl[:8]] + [f"  GitHub: {p}" for p in dr[:8]]
+        more = len(dl) + len(dr) - len(names)
+        text = (f"This will delete {len(dl)} file(s) from this folder and {len(dr)} file(s) from GitHub:"
+                f"\n\n" + "\n".join(names) + (f"\n  ... and {more} more" if more > 0 else "")
+                + "\n\nIf anything changes before it runs, nothing is done and the list is refreshed."
+                "\n\nContinue?")
         return QMessageBox.question(self, "Confirm deletions", text) == QMessageBox.StandardButton.Yes
 
     def do_sync(self, mode):
-        if self.busy or not self.confirm_deletes(mode):
+        if self.busy or not self.plan:
+            return
+        push, pull, digest = bound_actions(self.plan, mode)
+        if not self.confirm_deletes(push, pull):
             return
         root, message = self.root, self.msg.text().strip() or None
         ns = argparse.Namespace(dir=root, message=message, dry_run=False, yes=True,
-                                prefer=None, resolve=None, only=None)
+                                prefer=None, resolve=None, only=None, expect=digest)
         self.run_job(lambda: ghsync.run_sync(ns, mode), mode.title() + "ing" if mode != "sync" else "Syncing",
                      on_ok=lambda _: self.msg.clear(), then_refresh=True)
 
@@ -767,9 +795,13 @@ class Main(QMainWindow):
                                 f"Keep the {'local' if side == 'local' else 'GitHub'} version of {len(sel)} file(s)?\n\n"
                                 f"The {loser} will be overwritten.") != QMessageBox.StandardButton.Yes:
             return
+        if not self.plan:
+            return
+        resolve_map, only = {p: side for p in sel}, set(sel)
+        _, _, digest = bound_actions(self.plan, "sync", only=only, resolve=resolve_map)
         root, message = self.root, self.msg.text().strip() or None
         ns = argparse.Namespace(dir=root, message=message, dry_run=False, yes=True, prefer=None,
-                                resolve={p: side for p in sel}, only=set(sel))
+                                resolve=resolve_map, only=only, expect=digest)
         self.run_job(lambda: ghsync.run_sync(ns, "sync"), "Resolving", then_refresh=True)
 
     def diff_selected(self):
@@ -825,12 +857,7 @@ class Main(QMainWindow):
                     os.environ.pop("GITHUB_TOKEN", None)
                 else:
                     os.environ["GITHUB_TOKEN"] = had
-            with open(ghsync.TOKEN_FILE, "w", encoding="utf-8") as f:
-                f.write(tok)
-            try:
-                os.chmod(ghsync.TOKEN_FILE, 0o600)
-            except OSError:
-                pass
+            ghsync._save_token(tok)
             print(f"Logged in as {me['login']}.")
 
         def ok(_):
@@ -1009,8 +1036,7 @@ class Main(QMainWindow):
             local, _ = ghsync.scan_local(root)
             head = None
             if check_remote:
-                ref = ghsync.api("GET", f"/repos/{cfg['owner']}/{cfg['repo']}/git/ref/heads/{cfg['branch']}")
-                head = ref["object"]["sha"]
+                head = ghsync.remote_head(cfg)
             return local, head
 
         self._start_watch_job(job, self._tick_done)
