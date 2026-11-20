@@ -43,12 +43,14 @@ class TestGuiPlanBinding(Base):
         super().setUp()
         os.environ["GITHUB_TOKEN"] = "test-token"
         self.asked = []
-        self._q = QMessageBox.question
+        self._q, self._exec = QMessageBox.question, QMessageBox.exec
+        self.answer = QMessageBox.StandardButton.Yes
         QMessageBox.question = lambda *a, **k: (self.asked.append(a[2] if len(a) > 2 else ""),
-                                                QMessageBox.StandardButton.Yes)[1]
+                                                self.answer)[1]
+        QMessageBox.exec = lambda box: (self.asked.append(box.text()), self.answer)[1]
 
     def tearDown(self):
-        QMessageBox.question = self._q
+        QMessageBox.question, QMessageBox.exec = self._q, self._exec
         if getattr(self, "win", None):
             self.win._quitting = True
             self.win.timer.stop()
@@ -116,3 +118,84 @@ class TestGuiPlanBinding(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAVE_QT, "PyQt6 not installed")
+class TestGuiProtectLocal(TestGuiPlanBinding):
+    """Protect local in the real window (config without the key = protected)."""
+    test_deletion_appearing_after_review_is_not_executed = None
+    test_confirmed_deletion_runs = None
+    test_keep_github_resolution_is_bound = None
+    test_held_files_are_logged = None
+
+    def protect(self, value):
+        cfg = {"owner": "me", "repo": "proj", "branch": "main"}
+        if value is not None:
+            cfg["protect_local"] = value
+        ghsync.write_json(os.path.join(self.root, ".ghsync", "config.json"), cfg)
+
+    def start(self, files, github_changes):
+        self.protect(False)
+        self.synced(files)
+        self.protect(None)
+        self.gh.commit_files(github_changes, keep=True)
+        self.open()
+
+    def kinds(self):
+        return {self.win.table.item(r, 2).text(): self.win.table.item(r, 0).data(256)
+                for r in range(self.win.table.rowCount())}
+
+    def select(self, path):
+        for r in range(self.win.table.rowCount()):
+            if self.win.table.item(r, 2).text() == path:
+                self.win.table.selectRow(r)
+
+    def test_sync_mirrors_and_never_touches_folder(self):
+        self.start({"a.txt": "mine", "b.txt": "b"}, {"a.txt": b"web edit", "junk.txt": b"x"})
+        self.assertTrue(self.win.protect_chk.isChecked())
+        self.assertEqual(self.kinds(), {"a.txt": "mirror", "junk.txt": "mirror"})
+        self.win.do_sync("sync")
+        self.wait_idle()
+        self.assertEqual(self.gh.files(), {"a.txt": b"mine", "b.txt": b"b"})
+        self.assertEqual(self.read("a.txt"), b"mine")
+        self.assertTrue(any("GitHub: junk.txt" in t for t in self.asked))
+
+    def test_pull_override_declined_changes_nothing(self):
+        self.start({"a.txt": "mine"}, {"a.txt": b"github"})
+        self.assertTrue(self.win.b_pull.isEnabled())
+        self.answer = QMessageBox.StandardButton.No
+        self.win.do_sync("pull")
+        self.wait_idle()
+        self.assertEqual(self.read("a.txt"), b"mine")
+        self.assertIn("replace: a.txt", self.asked[-1])
+
+    def test_pull_override_accepted_backs_up_and_stays_protected(self):
+        self.start({"a.txt": "mine"}, {"a.txt": b"github"})
+        self.win.do_sync("pull")
+        self.wait_idle()
+        self.assertEqual(self.read("a.txt"), b"github")
+        bdir = os.path.join(self.root, ".ghsync", "backup")
+        self.assertEqual(len(os.listdir(bdir)), 1)
+        self.assertTrue(self.win.protect_chk.isChecked())
+        self.assertTrue(ghsync.protect_enabled(self.config()))
+
+    def test_keep_github_on_a_mirror_row(self):
+        self.start({"a.txt": "mine", "b.txt": "b"}, {"a.txt": b"github a", "b.txt": b"github b"})
+        self.select("a.txt")
+        self.assertTrue(self.win.b_keep_remote.isEnabled())
+        self.win.resolve("remote")
+        self.wait_idle()
+        self.assertEqual(self.read("a.txt"), b"github a")
+        self.assertEqual(self.read("b.txt"), b"b")             # only the selected file
+
+    def test_turning_protection_off_needs_confirmation(self):
+        self.start({"a.txt": "a"}, {})
+        self.answer = QMessageBox.StandardButton.No
+        self.win.protect_chk.setChecked(False)
+        self.assertTrue(self.win.protect_chk.isChecked())
+        self.assertTrue(ghsync.protect_enabled(self.config()))
+        self.answer = QMessageBox.StandardButton.Yes
+        self.win.protect_chk.setChecked(False)
+        self.wait_idle()
+        self.assertFalse(ghsync.protect_enabled(self.config()))
+        self.assertFalse(self.win.plan["protect"])

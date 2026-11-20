@@ -39,8 +39,9 @@ class Base(unittest.TestCase):
         os.makedirs(self.outside)
         self._api = ghsync.api
         self.gh = FakeGitHub().install(ghsync)
+        # The two-way tests run with Protect local off; TestProtectLocal covers the default.
         ghsync.write_json(os.path.join(self.root, ".ghsync", "config.json"),
-                          {"owner": "me", "repo": "proj", "branch": "main"})
+                          {"owner": "me", "repo": "proj", "branch": "main", "protect_local": False})
 
     def tearDown(self):
         ghsync.api = self._api
@@ -685,6 +686,75 @@ class TestIgnoreFiles(Base):
         with contextlib.redirect_stdout(buf):
             ghsync.cmd_status(argparse.Namespace(dir=self.root))
         self.assertIn("Ignore rules: .gitignore, .packagerignore", buf.getvalue())
+
+
+# ============== 0.3.1: a stale branch read must never roll the folder back
+class TestStaleBranchRead(Base):
+    def setUp(self):
+        super().setUp()
+        self._sleep = mock.patch("time.sleep", lambda *_: None)
+        self._sleep.start()
+
+    def tearDown(self):
+        self._sleep.stop()
+        super().tearDown()
+
+    def test_lagging_read_after_own_push_does_not_revert_local(self):
+        self.synced({"settings.py": "v1"})
+        self.write("settings.py", "v2")
+        self.sync()                                   # pushes v2
+        self.gh.lag(2)                                # GitHub briefly reports the v1 commit
+        self.sync()                                   # two-way sync (protection off)
+        self.assertEqual(self.read("settings.py"), b"v2")
+        self.assertEqual(self.gh.files()["settings.py"], b"v2")
+
+    def test_branch_that_stays_behind_is_refused(self):
+        self.synced({"a.txt": "v1"})
+        self.write("a.txt", "v2")
+        self.sync()
+        self.gh.lag(1000)
+        out = self.assert_fails(lambda: ghsync.run_sync(self.ns(), "sync"))
+        self.assertIn("older", out)
+        self.assertEqual(self.read("a.txt"), b"v2")
+
+    # GHS-011: an unavailable comparison must never be read as "safe"
+    def test_stale_head_with_compare_failure_does_not_revert_local(self):
+        self.synced({"settings.py": "v1"})
+        self.write("settings.py", "v2")
+        self.sync()
+        self.gh.lag(1000)
+        self.gh.compare_errors = -1
+        out = self.assert_fails(lambda: ghsync.run_sync(self.ns(), "sync"))
+        self.assertEqual(self.read("settings.py"), b"v2")
+        self.assertIn("couldn't confirm", out)
+
+    def test_unconfirmable_newer_head_is_refused_too(self):
+        self.synced({"a.txt": "a"})
+        self.gh.commit_files({"a.txt": b"newer"}, keep=True)
+        self.gh.compare_errors = -1
+        head = self.gh.ref
+        self.assert_fails(lambda: ghsync.run_sync(self.ns(), "sync"))
+        self.assertEqual(self.read("a.txt"), b"a")
+        self.assertEqual(self.gh.ref, head)
+
+    def test_transient_compare_failure_recovers(self):
+        self.synced({"a.txt": "a"})
+        self.gh.commit_files({"a.txt": b"newer"}, keep=True)
+        self.gh.compare_errors = 2
+        self.sync()
+        self.assertEqual(self.read("a.txt"), b"newer")
+
+    def test_force_push_is_not_mistaken_for_lag(self):
+        self.synced({"a.txt": "a"})
+        self.gh.force_push({"a.txt": b"a", "b.txt": b"rewritten history"})
+        self.sync()
+        self.assertEqual(self.read("b.txt"), b"rewritten history")
+
+    def test_normal_remote_progress_still_syncs(self):
+        self.synced({"a.txt": "a"})
+        self.gh.commit_files({"a.txt": b"newer"}, keep=True)
+        self.sync()
+        self.assertEqual(self.read("a.txt"), b"newer")
 
 
 # ================================== extra findings from verification (not in review)

@@ -15,15 +15,25 @@ Commands (run inside your project folder, or use -C <folder>):
   diff [paths...]            show differences (remote -> local)
   push                       send local changes to GitHub
   pull                       bring remote changes into the folder
-  sync                       pull then push (conflicts are reported, not touched)
+  sync                       Protect local ON (default): make GitHub mirror this folder
+                             Protect local OFF: pull then push (conflicts reported)
+  protect [on|off]           show or change Protect local for this folder
 
 Common flags for push/pull/sync:
   -m "message"   commit message          --dry-run   show plan only
   --yes          skip delete prompts     --prefer local|remote   resolve conflicts
+  --allow-local-overwrite    one-time permission to replace/delete files in the folder
+                             while Protect local is on (they are backed up first)
 
 Ignore rules: built-in defaults plus every one of .ghignore, .gitignore and .packagerignore
 found in the project root. A path matched by any of them is not synced.
 Per-project data lives in .ghsync/ (config + last-synced snapshot).
+
+Protect local (0.3, on by default): the folder is the single source of truth. Nothing in
+it is ever replaced or deleted; sync makes GitHub match it (reverting edits made on GitHub,
+restoring files deleted there, removing files that exist only there). Pulling needs a
+one-time --allow-local-overwrite, and every local file it replaces is first copied to
+.ghsync/backup/<time>/.
 
 Safety model (0.2):
   * One path policy for both sides. Paths GitHub sends are checked before anything is
@@ -60,7 +70,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-__version__ = "0.2.2"
+__version__ = "0.3.2"
 
 API = os.environ.get("GHSYNC_API", "https://api.github.com")
 STATE_DIR = ".ghsync"
@@ -116,6 +126,15 @@ class StateError(GhsyncError):
 
 class PlanChanged(GhsyncError):
     pass
+
+
+class ProtectedLocal(GhsyncError):
+    pass
+
+
+_PROTECT_HELP = ("Protect local is on for this folder, so ghsync won't replace or delete files in it. "
+                 "To do it once, use --allow-local-overwrite (the files are backed up to "
+                 ".ghsync/backup/ first), or turn protection off with: ghsync protect off")
 
 
 def die(msg):
@@ -898,11 +917,63 @@ def _damaged(path, why):
             "for you to resolve.")
 
 
+def _compare_status(cfg, base_sha, head_sha):
+    """GitHub's view of head relative to base: ahead / behind / diverged / identical,
+    or None when GitHub couldn't answer (which callers must treat as unknown, not safe)."""
+    try:
+        status = api("GET", repo_api(cfg, f"/compare/{base_sha}...{head_sha}")).get("status")
+    except ApiError:
+        return None
+    return status if status in ("ahead", "behind", "diverged", "identical") else None
+
+
+# A head GitHub confirms is the last-synced commit, a descendant of it, or a rewritten
+# history (force-push) is acted on. "behind" or no answer never is (GHS-011: fail closed).
+_SAFE_RELATIONS = ("ahead", "identical", "diverged")
+
+
+def fetch_remote_checked(cfg, last_commit, attempts=6):
+    """fetch_remote(), but only act on a branch head whose relation to the last sync is known.
+
+    Right after the branch moves, GitHub can briefly answer with the previous commit.
+    Acting on that would look like "GitHub went back to the old version": a two-way
+    sync would pull old content over the folder. So when the head differs from the
+    commit recorded at the last sync, GitHub's compare API must confirm it is ahead
+    (normal progress) or diverged (a force-push). If it is behind, or GitHub can't
+    answer the comparison, ghsync waits and re-reads, and refuses if that persists.
+    """
+    status = None
+    for attempt in range(attempts):
+        remote = fetch_remote(cfg)
+        if not last_commit or remote["commit"] == last_commit:
+            return remote
+        status = _compare_status(cfg, last_commit, remote["commit"])
+        if status in _SAFE_RELATIONS:
+            return remote
+        if attempt < attempts - 1:
+            time.sleep(min(1 + attempt, 4))
+    if status == "behind":
+        why = (f"GitHub is showing an older version of the branch ({remote['commit'][:7]}) than "
+               f"this folder last synced to ({last_commit[:7]}). This is usually GitHub catching "
+               "up after a recent push: try again in a minute.")
+    else:
+        why = (f"ghsync couldn't confirm how GitHub's branch ({remote['commit'][:7]}) relates to "
+               f"the commit this folder last synced to ({last_commit[:7]}): GitHub's compare "
+               "service didn't answer, or the two commits share no history. Try again in a minute.")
+    raise GhsyncError(
+        why + " Nothing was changed. If the branch was rolled back or replaced on GitHub on "
+        "purpose (or this folder was linked to a different repo), delete .ghsync/state.json and "
+        "sync again: with no previous state nothing is deleted, and differing files are listed "
+        "for you to decide.")
+
+
 def gather(root, cfg):
     """Snapshot both sides. Returns a dict: base, local, remote, held, temps."""
-    base = load_state(root).get("files", {})
+    state = load_state(root)
+    base = state.get("files", {})
     local, excluded = scan_local(root)
-    remote = fetch_remote(cfg)
+    last = state.get("commit") if isinstance(state.get("commit"), str) else None
+    remote = fetch_remote_checked(cfg, last)
     held = compute_held(root, base, local, excluded, remote)
     temps = [p for p, why in excluded.items() if why == _TEMP_REASON]
     return {"base": base, "local": local, "remote": remote, "held": held, "temps": temps,
@@ -925,8 +996,14 @@ def classify(base, local, remote, held=()):
     return push, pull, conflict, same
 
 
-def plan_actions(snap, mode, only=None, resolve=None, prefer=None):
-    """The exact push/pull sets a run in `mode` would execute for this snapshot."""
+def plan_actions(snap, mode, only=None, resolve=None, prefer=None, protect=False):
+    """The exact push/pull sets a run in `mode` would execute for this snapshot.
+
+    protect=True (Protect local): the pull set is always empty. In sync mode GitHub is
+    made to mirror the folder: everything GitHub changed since the last sync, and every
+    conflict, is pushed as the local version (or deleted on GitHub if it isn't local).
+    Held paths are never in any set, so ignored or unsafe GitHub files are left alone.
+    """
     push, pull, conflict, same = classify(snap["base"], snap["local"], snap["remote"]["files"],
                                           snap["held"])
     if only is not None:
@@ -946,7 +1023,20 @@ def plan_actions(snap, mode, only=None, resolve=None, prefer=None):
         pull = {}
     elif mode == "pull":
         push = {}
+    if protect:
+        if mode == "sync":
+            local = snap["local"]
+            for p in list(pull) + list(conflict):
+                push[p] = local.get(p)
+            conflict = {}
+        pull = {}
     return push, pull, conflict, same
+
+
+def drift(snap):
+    """Paths GitHub changed since the last sync (what a two-way sync would pull or flag)."""
+    _, pull, conflict, _ = classify(snap["base"], snap["local"], snap["remote"]["files"], snap["held"])
+    return set(pull) | set(conflict)
 
 
 def plan_digest(mode, push, pull):
@@ -1028,16 +1118,54 @@ def do_push(root, cfg, items, remote, message):
     return commit["sha"]
 
 
-def do_pull(root, cfg, items, local, temps=None):
+def _write_backup(bdir, rel, data):
+    target = os.path.join(bdir, *rel.split("/"))
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "xb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _backup_existing(root, bdir, rel, expect, counter):
+    """Copy the local file about to be replaced/deleted into the backup folder.
+
+    Raises (so the file is skipped, not overwritten) if it can't be read, no longer has
+    the content the plan saw, or the backup can't be written.
+    """
+    if expect is None:
+        return                                  # nothing local to lose
+    try:
+        data = read_local(root, rel)
+    except FileNotFoundError:
+        return
+    if blob_sha_bytes(data) != expect:
+        raise LocalChanged(f"{rel} changed locally during the sync; skipped (your edit is kept)")
+    try:
+        _write_backup(bdir, rel, data)
+    except OSError as e:
+        raise GhsyncError(f"couldn't back up {rel} ({e}); skipped, nothing was overwritten") from None
+    counter.append(rel)
+
+
+def do_pull(root, cfg, items, local, temps=None, allow_overwrite=False):
     """Apply remote changes one file at a time.
 
     Returns (done, failed): done = {path: sha or None} actually applied, failed =
     {path: reason}. A file that changed locally since the scan is skipped, never
-    overwritten. Deletions run first so case-only renames work on Windows.
+    overwritten. Every existing local file is backed up to .ghsync/backup/<time>/
+    before it is replaced or deleted. Deletions run first so case-only renames work
+    on Windows. Refuses outright while Protect local is on unless allow_overwrite.
     """
+    if protect_enabled(cfg) and not allow_overwrite:
+        raise ProtectedLocal(_PROTECT_HELP)
     done, failed = {}, {}
+    stamp = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
+    bdir = os.path.join(root, STATE_DIR, "backup", stamp)
+    backed = []
     for p in sorted(p for p, v in items.items() if v is None):
         try:
+            _backup_existing(root, bdir, p, local.get(p), backed)
             delete_local(root, p, expect=local.get(p))
             done[p] = None
         except (GhsyncError, OSError) as e:
@@ -1051,6 +1179,7 @@ def do_pull(root, cfg, items, local, temps=None):
             data = api("GET", repo_api(cfg, f"/git/blobs/{sha}"), raw=True)
             if blob_sha_bytes(data) != sha:
                 raise GhsyncError(f"download of {p} failed hash check")
+            _backup_existing(root, bdir, p, local.get(p), backed)
             write_local(root, p, data, expect=local.get(p),
                         temp_name=temps.next_name() if temps else None)
             return p, sha, None
@@ -1070,6 +1199,9 @@ def do_pull(root, cfg, items, local, temps=None):
                     done[p] = sha
                 if n % 25 == 0 or n == len(fetches):
                     print(f"    {n}/{len(fetches)}")
+    if backed:
+        print(f"  backed up {len(backed)} replaced/deleted local file(s) to "
+              f"{STATE_DIR}/backup/{stamp}/")
     return done, failed
 
 
@@ -1088,7 +1220,15 @@ def validate_cfg(cfg):
     if (not isinstance(branch, str) or not _BRANCH_RE.match(branch) or ".." in branch
             or "//" in branch or branch.startswith("/") or branch.endswith(("/", ".lock"))):
         raise StateError(f"config.json has an invalid branch: {branch!r}")
+    if "protect_local" in cfg and not isinstance(cfg["protect_local"], bool):
+        raise StateError(f"config.json has an invalid protect_local: {cfg['protect_local']!r} "
+                         "(must be true or false)")
     return cfg
+
+
+def protect_enabled(cfg):
+    """Protect local is on unless the config explicitly says false."""
+    return cfg.get("protect_local", True) is not False
 
 
 def load_cfg(args):
@@ -1099,8 +1239,9 @@ def load_cfg(args):
     return root, validate_cfg(cfg)
 
 
-def show_plan(snap, push, pull, conflict, failed=None):
+def show_plan(snap, push, pull, conflict, failed=None, mirror=()):
     local, remote = snap["local"], snap["remote"]
+    mirror = set(mirror)
 
     def block(title, lines):
         if not lines:
@@ -1115,7 +1256,8 @@ def show_plan(snap, push, pull, conflict, failed=None):
         return "A" if old_val is None else ("D" if new_val is None else "M")
 
     block("PUSH  (local -> GitHub)",
-          [f"{tag(v, remote['files'].get(p))} {p}" for p, v in sorted(push.items())])
+          [f"{tag(v, remote['files'].get(p))} {p}" + ("   (reverts GitHub-side change)" if p in mirror else "")
+           for p, v in sorted(push.items())])
     block("PULL  (GitHub -> local)",
           [f"{tag(v, local.get(p))} {p}" for p, v in sorted(pull.items())])
     block("CONFLICT  (changed on both sides)", sorted(conflict))
@@ -1145,10 +1287,13 @@ def held_to_show(snap):
 def cmd_status(args):
     root, cfg = load_cfg(args)
     snap = gather(root, cfg)
-    push, pull, conflict, _ = plan_actions(snap, "sync")
+    protect = protect_enabled(cfg)
+    push, pull, conflict, _ = plan_actions(snap, "sync", protect=protect)
     print(f"{cfg['owner']}/{cfg['repo']} @ {cfg['branch']}  (remote head {snap['remote']['commit'][:7]})")
     print("Ignore rules: " + (", ".join(ignore_files(root)) or "built-in defaults only"))
-    show_plan(snap, push, pull, conflict)
+    print("Protect local: " + ("ON - sync makes GitHub mirror this folder; nothing in the folder is "
+                               "replaced or deleted" if protect else "OFF - sync is two-way"))
+    show_plan(snap, push, pull, conflict, mirror=drift(snap) if protect else ())
     if conflict:
         print("\nResolve with: diff <path>, then sync --prefer local|remote")
 
@@ -1198,14 +1343,23 @@ def run_sync(args, mode):
 
 def _run_sync_locked(args, mode, root, cfg):
     state_path = os.path.join(root, STATE_DIR, "state.json")
+    allow = bool(getattr(args, "allow_local_overwrite", False))
+    protect = protect_enabled(cfg) and not allow
+    resolve = getattr(args, "resolve", None) or {}
+    if protect and (mode == "pull" or args.prefer == "remote" or "remote" in resolve.values()):
+        raise ProtectedLocal(_PROTECT_HELP)
     snap = gather(root, cfg)
     cleanup_temps(root, snap["temps"])
     remote = snap["remote"]
     push, pull, conflict, _ = plan_actions(snap, mode, getattr(args, "only", None),
-                                           getattr(args, "resolve", None), args.prefer)
+                                           resolve, args.prefer, protect=protect)
+    if protect and pull:          # second, independent guard: planning must never get here
+        raise ProtectedLocal("internal error: a local overwrite was planned while Protect local "
+                             "is on. Nothing was done.")
 
-    print(f"{cfg['owner']}/{cfg['repo']} @ {cfg['branch']}")
-    show_plan(snap, push, pull, conflict)
+    print(f"{cfg['owner']}/{cfg['repo']} @ {cfg['branch']}"
+          + ("   [Protect local: GitHub mirrors this folder]" if protect else ""))
+    show_plan(snap, push, pull, conflict, mirror=drift(snap) if protect else ())
 
     expect = getattr(args, "expect", None)
     if expect is not None and plan_digest(mode, push, pull) != expect:
@@ -1234,7 +1388,7 @@ def _run_sync_locked(args, mode, root, cfg):
         print("\nPulling...")
         temps = RunTemps(secrets.token_hex(8))
         _journal_set(root, journal_runs(root) + [temps.run_id])   # before any temp exists
-        done_pull, failed = do_pull(root, cfg, pull, snap["local"], temps)
+        done_pull, failed = do_pull(root, cfg, pull, snap["local"], temps, allow_overwrite=not protect)
         # Every temp of this run was renamed into place or removed by write_local.
         _journal_set(root, [r for r in journal_runs(root) if r != temps.run_id])
         # Record what the pull achieved before pushing, so an interrupted push loses nothing.
@@ -1283,10 +1437,33 @@ def cmd_login(args):
     print(f"Logged in as {me['login']}. Token saved to {TOKEN_FILE}")
 
 
-def save_cfg(root, owner, repo, branch):
-    cfg = validate_cfg({"owner": owner, "repo": repo, "branch": branch})
+def save_cfg(root, owner, repo, branch, protect_local=True):
+    cfg = validate_cfg({"owner": owner, "repo": repo, "branch": branch, "protect_local": protect_local})
     with ProjectLock(root):
         write_json(os.path.join(root, STATE_DIR, "config.json"), cfg)
+
+
+def set_protect(root, on):
+    """Turn Protect local on or off for a linked folder."""
+    with ProjectLock(root):
+        path = os.path.join(root, STATE_DIR, "config.json")
+        cfg = validate_cfg(read_json(path, None, strict=True))
+        cfg["protect_local"] = bool(on)
+        write_json(path, cfg)
+    return cfg
+
+
+def cmd_protect(args):
+    root, cfg = load_cfg(args)
+    if args.state:
+        cfg = set_protect(root, args.state == "on")
+    on = protect_enabled(cfg)
+    print(f"Protect local: {'ON' if on else 'OFF'}")
+    print("  sync makes GitHub mirror this folder; nothing in the folder is replaced or deleted.\n"
+          "  Pulling needs --allow-local-overwrite (files are backed up to .ghsync/backup/ first)."
+          if on else
+          "  sync is two-way: changes made on GitHub are pulled into this folder\n"
+          "  (every replaced or deleted local file is backed up to .ghsync/backup/ first).")
 
 
 def cmd_link(args):
@@ -1334,6 +1511,8 @@ def main():
     p.add_argument("repo")
     p.add_argument("--branch")
     sub.add_parser("status")
+    p = sub.add_parser("protect")
+    p.add_argument("state", nargs="?", choices=["on", "off"])
     p = sub.add_parser("diff")
     p.add_argument("paths", nargs="*")
     for name in ("push", "pull", "sync"):
@@ -1342,6 +1521,8 @@ def main():
         p.add_argument("--dry-run", action="store_true")
         p.add_argument("--yes", action="store_true")
         p.add_argument("--prefer", choices=["local", "remote"])
+        p.add_argument("--allow-local-overwrite", action="store_true",
+                       help="one-time permission to replace/delete local files while Protect local is on")
 
     args = ap.parse_args()
     for s in (sys.stdout, sys.stderr):
@@ -1358,6 +1539,8 @@ def main():
             cmd_link(args)
         elif args.cmd == "status":
             cmd_status(args)
+        elif args.cmd == "protect":
+            cmd_protect(args)
         elif args.cmd == "diff":
             cmd_diff(args)
         else:

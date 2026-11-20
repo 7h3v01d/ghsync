@@ -10,7 +10,7 @@ The repository must already exist with at least one commit (create it on github.
 with "Add a README"). The test adds, changes and deletes files under smoke/ in that
 repo and leaves a few commits behind. Never point it at a repo you care about.
 
-Exit code 0 = every step passed.
+Exit code 0 = every step passed (14 steps).
 """
 import argparse
 import base64
@@ -30,13 +30,24 @@ RESULTS = []
 
 def step(name, ok, detail=""):
     RESULTS.append(ok)
-    print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f"  ({detail})" if detail and not ok else ""))
+    print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f"\n  {detail}" if detail and not ok else ""))
 
 
 def quiet(fn, *a):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         return fn(*a), buf.getvalue()
+
+
+def settle(cfg, sha, timeout=45):
+    """Wait until GitHub reports `sha` as the branch head (reads can lag just after a move)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if ghsync.remote_head(cfg) == sha:
+            return True
+        time.sleep(1)
+    print(f"  (warning: GitHub still not reporting {sha[:7]} as head after {timeout}s)")
+    return False
 
 
 def remote_commit(cfg, files, message):
@@ -54,6 +65,7 @@ def remote_commit(cfg, files, message):
     t = ghsync.api("POST", ghsync.repo_api(cfg, "/git/trees"), {"base_tree": tree, "tree": entries})["sha"]
     c = ghsync.api("POST", ghsync.repo_api(cfg, "/git/commits"), {"message": message, "tree": t, "parents": [head]})
     ghsync.api("PATCH", ghsync.ref_api(cfg, single=False), {"sha": c["sha"]})
+    settle(cfg, c["sha"])
 
 
 def main():
@@ -71,7 +83,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="ghsync-smoke-")
     root = os.path.join(tmp, "proj")
     os.makedirs(root)
-    ghsync.save_cfg(root, **cfg)
+    ghsync.save_cfg(root, **cfg, protect_local=False)     # steps 1-8: two-way sync
     ns = argparse.Namespace(dir=root, message=None, dry_run=False, yes=True, prefer=None,
                             resolve=None, only=None)
     stamp = time.strftime("%H%M%S")
@@ -84,7 +96,14 @@ def main():
         with open(path(rel), "wb") as f:
             f.write(data)
 
+    def synced_head():
+        st = ghsync.read_json(os.path.join(root, ".ghsync", "state.json"), {}) or {}
+        return st.get("commit")
+
     def remote_files():
+        head = synced_head()
+        if head:
+            settle(cfg, head)       # check against what ghsync last pushed, not a lagging read
         return ghsync.fetch_remote(cfg)["files"]
 
     try:
@@ -149,8 +168,31 @@ def main():
         quiet(ghsync.run_sync, ns, "sync")
         step("re-baseline deletes nothing", set(before) <= set(remote_files()))
 
+        # 9. Protect local (0.3): GitHub mirrors the folder, the folder is never touched
+        ghsync.set_protect(root, True)
+        remote_commit(cfg, {"smoke/a.txt": b"edited on github again", "smoke/junk.txt": b"leftover"},
+                      "smoke: drift on github")
+        _, out = quiet(ghsync.run_sync, ns, "sync")
+        rf = remote_files()
+        blob = ghsync.api("GET", ghsync.repo_api(cfg, f"/git/blobs/{rf['smoke/a.txt']}"), raw=True)
+        step("protect: folder untouched", open(path("smoke/a.txt"), "rb").read() == b"local side")
+        ok = blob == b"local side" and "smoke/junk.txt" not in rf
+        step("protect: GitHub edit reverted and GitHub-only file removed", ok,
+             f"GitHub a.txt={blob[:40]!r}, junk.txt on GitHub={'smoke/junk.txt' in rf}, "
+             f"head={ghsync.remote_head(cfg)[:7]}, last synced={(synced_head() or '?')[:7]}\n"
+             "  ghsync said:\n    " + "\n    ".join(out.strip().splitlines()[-15:]))
+        remote_commit(cfg, {"smoke/a.txt": b"one more github edit"}, "smoke: drift again")
+        try:
+            quiet(ghsync.run_sync, ns, "pull")
+            refused = False
+        except ghsync.ProtectedLocal:
+            refused = True
+        step("protect: pull refused without override",
+             refused and open(path("smoke/a.txt"), "rb").read() == b"local side")
+
         # clean up what the smoke test added
-        remote_commit(cfg, {p: None for p in remote_files() if p.startswith(("smoke/", ".ghsync/"))},
+        remote_commit(cfg, {p: None for p in ghsync.fetch_remote(cfg)["files"]
+                            if p.startswith(("smoke/", ".ghsync/"))},
                       "smoke: cleanup")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

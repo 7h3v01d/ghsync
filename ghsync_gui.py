@@ -200,15 +200,22 @@ class Worker(QThread):
 def compute_plan(root):
     root, cfg = ghsync.load_cfg(argparse.Namespace(dir=root))
     snap = ghsync.gather(root, cfg)
-    push, pull, conflict, same = ghsync.plan_actions(snap, "sync")
+    protect = ghsync.protect_enabled(cfg)
+    push, pull, conflict, same = ghsync.plan_actions(snap, "sync", protect=protect)
+    # What a two-way pull would do: only reachable through the explicit override.
+    _, locked_pull, _, _ = ghsync.plan_actions(snap, "pull") if protect else ({}, {}, {}, [])
+    mirror = (ghsync.drift(snap) & set(push)) if protect else set()
     return dict(cfg=cfg, snap=snap, base=snap["base"], local=snap["local"], remote=snap["remote"],
                 push=push, pull=pull, conflict=conflict, same=len(same),
-                held=ghsync.held_to_show(snap))
+                held=ghsync.held_to_show(snap), protect=protect, mirror=mirror,
+                locked_pull=locked_pull)
 
 
-def bound_actions(plan, mode, only=None, resolve=None):
-    """What a run would execute from this plan, plus the digest that binds the run to it."""
-    push, pull, _, _ = ghsync.plan_actions(plan["snap"], mode, only=only, resolve=resolve)
+def bound_actions(plan, mode, only=None, resolve=None, allow=False):
+    """What a run would execute from this plan, plus the digest that binds the run to it.
+    allow=True is the one-time Protect local override."""
+    protect = plan.get("protect", False) and not allow
+    push, pull, _, _ = ghsync.plan_actions(plan["snap"], mode, only=only, resolve=resolve, protect=protect)
     return push, pull, ghsync.plan_digest(mode, push, pull)
 
 
@@ -363,6 +370,16 @@ class Main(QMainWindow):
         self.watch_chk.setStyleSheet("font-size:10px;font-weight:700;letter-spacing:2px;")
         self.watch_chk.toggled.connect(self.set_watch)
         sbl.addWidget(self.watch_chk)
+        sbl.addSpacing(18)
+        self.protect_chk = QCheckBox("PROTECT LOCAL")
+        self.protect_chk.setChecked(True)
+        self.protect_chk.setEnabled(False)
+        self.protect_chk.setToolTip("This folder is the source of truth. Nothing in it is replaced or "
+                                    "deleted; SYNC makes GitHub mirror it. PULL and KEEP GITHUB ask first "
+                                    "and back files up to .ghsync/backup/.")
+        self.protect_chk.setStyleSheet("font-size:10px;font-weight:700;letter-spacing:2px;")
+        self.protect_chk.toggled.connect(self.set_protect)
+        sbl.addWidget(self.protect_chk)
         sbl.addSpacing(18)
         hint = QLabel("F5 REFRESH")
         hint.setStyleSheet(f"color:{DIM};font-size:10px;font-weight:700;letter-spacing:2px;")
@@ -605,11 +622,12 @@ class Main(QMainWindow):
             return
         sel = self.selected_rows()
         has_conf = any(d == "conflict" for d, _ in sel)
+        has_mirror = any(d == "mirror" for d, _ in sel)
         self.b_keep_local.setEnabled(has_conf)
-        self.b_keep_remote.setEnabled(has_conf)
+        self.b_keep_remote.setEnabled(has_conf or has_mirror)
         self.b_diff.setEnabled(bool(sel))
         if self.plan:
-            self.b_pull.setEnabled(bool(self.plan["pull"]))
+            self.b_pull.setEnabled(bool(self.plan["pull"] or self.plan.get("locked_pull")))
             self.b_push.setEnabled(bool(self.plan["push"]))
             self.b_sync.setEnabled(bool(self.plan["push"] or self.plan["pull"]))
 
@@ -665,6 +683,7 @@ class Main(QMainWindow):
         self.table.setRowCount(0)
         cfg = ghsync.read_json(self.cfg_path(), None)
         self.cfg = cfg
+        self.show_protect(cfg)
         self.update_tray()
         if cfg and self.has_token():
             self.repo_lbl.setText(f"{cfg['owner']}/{cfg['repo']}  ·  {cfg['branch']}")
@@ -697,6 +716,7 @@ class Main(QMainWindow):
         self.plan = plan
         self.last_local = dict(plan["local"])
         cfg = plan["cfg"]
+        self.show_protect(cfg)
         self.repo_lbl.setText(f"{cfg['owner']}/{cfg['repo']}  ·  {cfg['branch']}  ·  "
                               f"head {plan['remote']['commit'][:7]}")
         push, pull, conf = plan["push"], plan["pull"], plan["conflict"]
@@ -709,10 +729,12 @@ class Main(QMainWindow):
             return "ADD" if old is None else ("DEL" if new is None else "MOD")
 
         rows = [("conflict", "CONFLICT", "BOTH", p) for p in sorted(conf)]
-        rows += [("push", "PUSH", tag(v, plan["remote"]["files"].get(p)), p) for p, v in sorted(push.items())]
+        mirror = plan.get("mirror", set())
+        rows += [("mirror" if p in mirror else "push", "MIRROR" if p in mirror else "PUSH",
+                  tag(v, plan["remote"]["files"].get(p)), p) for p, v in sorted(push.items())]
         rows += [("pull", "PULL", tag(v, plan["local"].get(p)), p) for p, v in sorted(pull.items())]
-        colors = {"conflict": RED, "push": AMBER, "pull": BLUE}
-        glyph = {"conflict": "◆", "push": "▲", "pull": "▼"}
+        colors = {"conflict": RED, "push": AMBER, "pull": BLUE, "mirror": AMBER}
+        glyph = {"conflict": "◆", "push": "▲", "pull": "▼", "mirror": "⟲"}
         chg_color = {"ADD": GREEN, "DEL": RED, "MOD": MUTED, "BOTH": RED}
 
         self.table.setUpdatesEnabled(False)
@@ -727,6 +749,12 @@ class Main(QMainWindow):
             b = QTableWidgetItem(chg)
             b.setForeground(QColor(chg_color[chg]))
             c = QTableWidgetItem(path)
+            if kind == "mirror":
+                tip = {"ADD": "Deleted on GitHub - your copy will be restored there",
+                       "DEL": "Exists only on GitHub - it will be removed there",
+                       "MOD": "Changed on GitHub - your version will replace it"}[chg]
+                for it in (a, b, c):
+                    it.setToolTip(tip + ". Select it and press KEEP GITHUB to take GitHub's version instead.")
             for it in (a, b, c):
                 self.table.setItem(r, (a, b, c).index(it), it)
         for r in range(self.table.rowCount()):
@@ -774,34 +802,65 @@ class Main(QMainWindow):
                 "\n\nContinue?")
         return QMessageBox.question(self, "Confirm deletions", text) == QMessageBox.StandardButton.Yes
 
+    def confirm_overwrite(self, pull):
+        """One-time Protect local override. Lists exactly what changes in the folder."""
+        local = self.plan["local"]
+        repl = sorted(p for p, v in pull.items() if v is not None and local.get(p) is not None)
+        dels = sorted(p for p, v in pull.items() if v is None)
+        new = sorted(p for p, v in pull.items() if v is not None and local.get(p) is None)
+        names = ([f"  replace: {p}" for p in repl[:6]] + [f"  delete:  {p}" for p in dels[:6]]
+                 + [f"  add:     {p}" for p in new[:6]])
+        more = len(repl) + len(dels) + len(new) - len(names)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Protect local is on")
+        box.setText(f"Allow GitHub to change this folder, just this once?\n\n"
+                    f"{len(repl)} file(s) replaced, {len(dels)} deleted, {len(new)} added:\n\n"
+                    + "\n".join(names) + (f"\n  ... and {more} more" if more > 0 else "")
+                    + "\n\nEvery replaced or deleted file is copied to .ghsync/backup/ first. "
+                    "Protect local stays on afterwards.")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return box.exec() == QMessageBox.StandardButton.Yes
+
     def do_sync(self, mode):
         if self.busy or not self.plan:
             return
-        push, pull, digest = bound_actions(self.plan, mode)
-        if not self.confirm_deletes(push, pull):
+        allow = mode == "pull" and self.plan.get("protect", False)
+        push, pull, digest = bound_actions(self.plan, mode, allow=allow)
+        if allow:
+            if not pull or not self.confirm_overwrite(pull):
+                return
+        elif not self.confirm_deletes(push, pull):
             return
         root, message = self.root, self.msg.text().strip() or None
         ns = argparse.Namespace(dir=root, message=message, dry_run=False, yes=True,
-                                prefer=None, resolve=None, only=None, expect=digest)
+                                prefer=None, resolve=None, only=None, expect=digest,
+                                allow_local_overwrite=allow)
         self.run_job(lambda: ghsync.run_sync(ns, mode), mode.title() + "ing" if mode != "sync" else "Syncing",
                      on_ok=lambda _: self.msg.clear(), then_refresh=True)
 
     def resolve(self, side):
-        sel = [p for d, p in self.selected_rows() if d == "conflict"]
-        if self.busy or not sel:
-            return
-        loser = "GitHub" if side == "local" else "your local copy"
-        if QMessageBox.question(self, "Resolve conflicts",
-                                f"Keep the {'local' if side == 'local' else 'GitHub'} version of {len(sel)} file(s)?\n\n"
-                                f"The {loser} will be overwritten.") != QMessageBox.StandardButton.Yes:
-            return
-        if not self.plan:
+        kinds = ("conflict", "mirror") if side == "remote" else ("conflict",)
+        sel = [p for d, p in self.selected_rows() if d in kinds]
+        if self.busy or not sel or not self.plan:
             return
         resolve_map, only = {p: side for p in sel}, set(sel)
-        _, _, digest = bound_actions(self.plan, "sync", only=only, resolve=resolve_map)
+        allow = side == "remote" and self.plan.get("protect", False)
+        _, pull, digest = bound_actions(self.plan, "sync", only=only, resolve=resolve_map, allow=allow)
+        if allow:
+            if not self.confirm_overwrite(pull):
+                return
+        else:
+            loser = "GitHub" if side == "local" else "your local copy"
+            if QMessageBox.question(self, "Resolve conflicts",
+                                    f"Keep the {'local' if side == 'local' else 'GitHub'} version of {len(sel)} file(s)?\n\n"
+                                    f"The {loser} will be overwritten.") != QMessageBox.StandardButton.Yes:
+                return
         root, message = self.root, self.msg.text().strip() or None
         ns = argparse.Namespace(dir=root, message=message, dry_run=False, yes=True, prefer=None,
-                                resolve=resolve_map, only=only, expect=digest)
+                                resolve=resolve_map, only=only, expect=digest,
+                                allow_local_overwrite=allow)
         self.run_job(lambda: ghsync.run_sync(ns, "sync"), "Resolving", then_refresh=True)
 
     def diff_selected(self):
@@ -939,6 +998,38 @@ class Main(QMainWindow):
         if self.tray:
             self.tray.hide()
         QApplication.quit()
+
+    def show_protect(self, cfg):
+        self.protect_chk.blockSignals(True)
+        self.protect_chk.setEnabled(bool(cfg))
+        self.protect_chk.setChecked(ghsync.protect_enabled(cfg) if cfg else True)
+        self.protect_chk.blockSignals(False)
+
+    def set_protect(self, on):
+        if not self.cfg or self.busy:
+            self.show_protect(self.cfg)
+            return
+        if not on:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Turn off Protect local?")
+            box.setText("With Protect local off, SYNC becomes two-way: changes made on GitHub "
+                        "(web edits, other machines, bots) are pulled into this folder and can "
+                        "replace or delete your files. Replaced files are still backed up to "
+                        ".ghsync/backup/.\n\nTurn it off for this folder?")
+            box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            box.setDefaultButton(QMessageBox.StandardButton.No)
+            if box.exec() != QMessageBox.StandardButton.Yes:
+                self.show_protect(self.cfg)
+                return
+        try:
+            self.cfg = ghsync.set_protect(self.root, on)
+        except Exception as e:          # noqa: BLE001 - e.g. another ghsync holds the folder
+            self.log_write(f"{type(e).__name__}: {e}\n", "err")
+            self.show_protect(self.cfg)
+            return
+        self.log_write(f"\n[protect] Protect local is now {'ON' if on else 'OFF'} for this folder.\n", "mark")
+        self.refresh()
 
     def set_watch(self, on):
         self.watch_on = bool(on)

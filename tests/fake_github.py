@@ -62,6 +62,8 @@ class FakeGitHub:
         self.commits = {}      # sha -> {"tree", "parents"}
         self.ref = None
         self.on_blob_download = None   # optional hook(sha) called before returning blob bytes
+        self.stale = None              # (sha, n): the next n ref reads return sha (replication lag)
+        self.compare_errors = 0        # the next n compare calls fail (-1 = always)
         self.calls = []
         self._mod = None
         self._n = 0
@@ -101,6 +103,17 @@ class FakeGitHub:
         self.ref = self._new_commit(tree, parents)
         return self.ref
 
+    def lag(self, n, sha=None):
+        """Make the next n branch reads return an older commit (default: the parent)."""
+        old = sha or self.commits[self.ref]["parents"][0]
+        self.stale = (old, n)
+
+    def force_push(self, files):
+        """Rewrite the branch to an unrelated commit, like a force-push on GitHub."""
+        flat = {p: {"mode": "100644", "type": "blob", "sha": self.put_blob(d)} for p, d in files.items()}
+        self.ref = self._new_commit(self._store_tree(flat), [])
+        return self.ref
+
     def flat(self):
         return self.trees[self.commits[self.ref]["tree"]]
 
@@ -121,7 +134,26 @@ class FakeGitHub:
         self.calls.append((method, path))
         pre = f"/repos/{self.owner}/{self.repo}"
         if method == "GET" and path == f"{pre}/git/ref/heads/{self.branch}":
+            if self.stale and self.stale[1] > 0:
+                self.stale = (self.stale[0], self.stale[1] - 1)
+                return {"object": {"sha": self.stale[0]}}
             return {"object": {"sha": self.ref}}
+        if method == "GET" and path.startswith(f"{pre}/compare/"):
+            if self.compare_errors:
+                self.compare_errors -= 1 if self.compare_errors > 0 else 0
+                raise self._err(503, "compare unavailable")
+            base, head = path.rsplit("/", 1)[1].split("...")
+            if base not in self.commits or head not in self.commits:
+                raise self._err(404, "No common ancestor")
+            if base == head:
+                status = "identical"
+            elif base in self._ancestors(head):
+                status = "ahead"
+            elif head in self._ancestors(base):
+                status = "behind"
+            else:
+                status = "diverged"
+            return {"status": status}
         if method == "GET" and path.startswith(f"{pre}/git/commits/"):
             c = self.commits[path.rsplit("/", 1)[1]]
             return {"sha": path.rsplit("/", 1)[1], "tree": {"sha": c["tree"]}}

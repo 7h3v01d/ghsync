@@ -10,6 +10,7 @@ Uploading through github.com stops at 100 files per upload, and checking whether
 
 ## Features
 
+- **Protect local (on by default).** Your folder is the single source of truth: nothing in it is ever replaced or deleted, and SYNC makes GitHub mirror it. See [Protect local](#protect-local).
 - **No git required.** Pure Python standard library (3.8+) for the CLI. Only the GUI needs PyQt6.
 - **No 100-file limit.** Files are uploaded through the GitHub REST API (Git Data endpoints).
 - **Knows who changed what.** A three-way comparison (last synced state, your folder, GitHub) separates "changed here", "changed on GitHub" and "changed on both".
@@ -47,15 +48,43 @@ python ghsync.py init my-project --public   # ...or a public one
 python ghsync.py link owner/repo            # ...or link a repo that already exists
 ```
 
-Linking an existing repo is the easy way to adopt a project you previously uploaded by browser: identical files show as in sync and only the real differences appear.
+Linking an existing repo is the easy way to adopt a project you previously uploaded by browser: identical files show as in sync and only the real differences appear. With Protect local on (the default), the first SYNC also clears out old files that exist only on GitHub. Every deletion is listed and confirmed first, so it replaces the old download-the-zip-and-WinMerge clean-up.
 
 **4. Sync.**
 
 ```
 python ghsync.py status     # what would be pushed / pulled / in conflict
 python ghsync.py diff       # show the differences
-python ghsync.py sync       # pull, then push
+python ghsync.py sync       # make GitHub mirror this folder (Protect local, the default)
 ```
+
+## Protect local
+
+Most of the time the folder on your PC is the real project and GitHub is just where it's stored. Protect local is built for that, and it is **on by default** for every project, including ones linked before 0.3.
+
+**With Protect local on:**
+
+| GitHub side | What SYNC does | Your folder |
+|---|---|---|
+| A file was edited on GitHub (web edit, another machine, a bot) | Puts your version back on GitHub | untouched |
+| A file was deleted on GitHub | Restores your copy on GitHub | untouched |
+| A file exists only on GitHub (old leftovers) | Deletes it from GitHub, after confirmation | untouched |
+| You changed or deleted a file locally | Pushes the change, as always | untouched |
+| Changed on both sides | Your version wins | untouched |
+| Ignored, unsafe or otherwise *held* | Left alone on both sides | untouched |
+
+Nothing in the folder is ever replaced or deleted. This is enforced twice: planning never produces a local write, and the code that writes local files refuses to run on its own. PUSH sends only your own changes and leaves GitHub-side edits in place. In the GUI, the files GitHub changed show as **⟲ MIRROR** rows, so you can see exactly what will be reverted or removed before you click SYNC. Mirroring is one commit, so anything it reverts or removes is still in GitHub's history.
+
+**Taking something from GitHub on purpose** needs a one-time override:
+
+- GUI: **PULL** (everything GitHub changed), or select MIRROR or conflict rows and press **KEEP GITHUB**. A dialog lists every file that would be replaced, deleted or added, with *No* as the default.
+- CLI: `pull --allow-local-overwrite` (or `sync --prefer remote --allow-local-overwrite`).
+
+The override applies to that one run only; protection stays on.
+
+**Backups:** before ghsync replaces or deletes any local file, with protection on or off, it copies the current version to `.ghsync/backup/<date-time>/`, keeping the same folder layout. If a backup can't be written, that file is skipped, not overwritten. Backups are never synced; delete old ones when you no longer need them.
+
+**Turning it off** (two-way sync, where changes made on GitHub are pulled in): `ghsync protect off`, or untick **PROTECT LOCAL** in the GUI, which asks you to confirm. `ghsync protect` shows the current setting, and `status` prints it on every run.
 
 ## Command reference
 
@@ -67,8 +96,9 @@ Global option: `-C <folder>` runs against a folder other than the current one (p
 | `init <name> [--public] [--org ORG] [--description TEXT] [-m MSG]` | Create a repo on GitHub, link this folder and upload everything. |
 | `link <owner/repo> [--branch NAME]` | Link this folder to an existing repo (default branch unless given). |
 | `status` | Compare folder and repo and show the plan. Changes nothing. |
+| `protect [on\|off]` | Show or change Protect local for this folder. |
 | `diff [paths...]` | Unified diff, GitHub to local. Binary files just report that they differ. |
-| `push` / `pull` / `sync` | Send local changes, fetch remote changes, or both. |
+| `push` / `pull` / `sync` | Send local changes, fetch remote changes, or sync. With Protect local on, `sync` mirrors the folder to GitHub and `pull` needs `--allow-local-overwrite`. |
 
 Options for `push`, `pull` and `sync`:
 
@@ -77,7 +107,8 @@ Options for `push`, `pull` and `sync`:
 | `-m "message"` | Commit message (default: `ghsync: N file(s) changed (timestamp)`). |
 | `--dry-run` | Print the plan and stop. |
 | `--yes` | Skip the deletion confirmation. |
-| `--prefer local\|remote` | Resolve every conflict in favour of one side. |
+| `--prefer local\|remote` | Resolve every conflict in favour of one side (`remote` needs the override while Protect local is on). |
+| `--allow-local-overwrite` | One-time permission to replace or delete files in the folder while Protect local is on. They are backed up first. |
 
 Each sync is one commit containing all the changes. It appears under your GitHub account.
 
@@ -94,6 +125,7 @@ Keep `ghsync_gui.py` in the same folder as `ghsync.py`.
 - **First run on a folder:** save your token, then either create a new repo from the folder or link an existing one.
 - **Counters and list:** PUSH, PULL, CONFLICT and IN SYNC counts sit above the list of every pending file, tagged ADD, MOD or DEL.
 - **Actions:** SYNC, PUSH, PULL, REFRESH (or F5), plus an optional commit message. Double-click a file or press DIFF for a coloured diff.
+- **PROTECT LOCAL** (bottom bar, on by default): files GitHub changed show as **⟲ MIRROR** rows and SYNC puts your version back. PULL and KEEP GITHUB become a one-time override that lists the affected files and backs them up first. Unticking it asks for confirmation.
 - **Conflicts:** select the conflicting files and choose **KEEP LOCAL** (overwrite GitHub) or **KEEP GITHUB** (overwrite your copy). Each asks for confirmation.
 - **Deletions** always ask first. The window also refreshes when you click back into it.
 
@@ -139,6 +171,7 @@ A correct sync decision is not the same as a safe file operation, so 0.2 checks 
 - **Pull preconditions.** Downloads go to a temp file first. Right before a file is replaced or deleted, its current content is compared with what the scan saw. If it changed, that file is skipped (your edit is kept) and it shows up again on the next run, usually as a conflict.
 - **One operation at a time.** Every push, pull, sync, link or init holds an OS-level lock on `.ghsync/lock`. A second ghsync (another window, the CLI, the tray) is refused with the owner's PID. The OS releases the lock if the process dies, so a crash never leaves a stale lock behind.
 - **Atomic state.** `state.json`, `config.json` and `cache.json` are written to a temp file, flushed and renamed, so a crash leaves the previous version intact. A damaged `state.json` stops the run with instructions instead of being silently reset. Pull results are saved before the push starts. If a pull is interrupted, the next run removes its leftover temp files, but only ones ghsync can prove it created: each pull records a run ID in `.ghsync/journal.json` before writing any temp file, and cleanup deletes only exact `.ghsync-<run id>-<n>.ghsync-tmp` names from a recorded run. Your own files are never deleted by cleanup, whatever they're called.
+- **GitHub lag can't roll you back.** Right after the branch moves, GitHub can briefly report the previous commit. Whenever the branch has moved since the last sync, GitHub's compare service must confirm the new head is *ahead* of the last-synced commit (normal progress) or *diverged* from it (a force-push). If it's *behind*, or GitHub can't answer, ghsync waits and checks again, and refuses if that persists. An unknown answer is never treated as safe. If you rolled the branch back on GitHub on purpose, replaced it with unrelated history, or re-linked the folder to a different repo, delete `.ghsync/state.json` and sync again.
 - **Approval is bound to execution.** The GUI fingerprints the exact plan you confirmed. If the folder or GitHub changed in between, nothing runs and the list refreshes.
 
 **Recovering from an interruption:** just run `sync` again. Files already transferred compare equal on both sides and are recorded as in sync; anything unfinished is planned again. If `state.json` is ever damaged, delete it and run `status`: with no previous state ghsync never deletes anything, and differing files show as conflicts.
@@ -166,20 +199,21 @@ Ignore rules apply to both sides. Ignoring a file that was already synced does *
 ## Limitations and rough edges
 
 - **Not a git replacement.** There is no history browsing, no branches (it syncs one branch), and conflicts are resolved by choosing a whole file, not by merging text.
-- **After `init`, an existing `README.md` shows as a conflict once.** GitHub creates a placeholder README when the repo is created. Resolve it with *KEEP LOCAL* (or `--prefer local`) and it stays quiet from then on.
+- **GitHub's placeholder README after `init`.** GitHub creates one when the repo is created. With Protect local on, the first sync replaces it with your `README.md`, or removes it if you don't have one. With protection off, an existing local `README.md` shows as a conflict once; resolve it with *KEEP LOCAL*.
 - **Comparison is byte for byte.** There is no line-ending normalisation, so a file with CRLF locally and LF on GitHub counts as changed.
 - **Files over 100 MB are skipped** (GitHub's limit). Very large files upload through the REST API as base64 and can be slow.
 - **Empty folders and symlinks are not synced.** Local symlinks and junctions are skipped (and listed as held); symlinks and submodules on GitHub are left alone. Existing files keep their executable bit on both sides; new files are created as non-executable.
 - **Known issue (GHS-010, low):** if a pull is killed mid-write and that folder is then added to your ignore rules, the leftover `.ghsync-<id>-<n>.ghsync-tmp` file there isn't cleaned up. It's harmless and never synced; delete it by hand. A fix is planned.
+- **Backups survive crashes, not necessarily power cuts.** Each backup file is flushed to disk before the original is touched, but the folder entry that names it isn't separately flushed. After a sudden power loss, a backup made in the last moments could be missing. For anything irreplaceable, keep a separate backup as well.
 - **Remaining race window.** The containment checks run immediately before each rename, but on Windows there is no way to rule out a folder being swapped for a junction in the instant between the check and the rename. That would need someone actively racing ghsync on your own machine; a hostile repository alone can't do it.
 - **Very large repos:** if GitHub truncates the file listing, `ghsync` refuses to sync rather than guess.
 - **The token is stored in plain text** in `~/.ghsync_token`. Use a fine-grained token limited to the repos you sync. Windows Credential Manager support is planned.
 
 ## Status
 
-0.2.2: `.gitignore` and `.packagerignore` are now always honoured alongside `.ghignore` (previously `.gitignore` was only used when there was no `.ghignore`). 0.2.1, "Safe Sync". 0.2 fixed the filesystem-safety, concurrency and recovery findings from an independent review (GHS-001 to GHS-008); 0.2.1 fixes the one defect found in the follow-up review (GHS-009: temp cleanup could delete user files ending in `.ghsync-tmp`). No new features.
+0.3.2: the stale-branch guard fails closed when GitHub can't confirm the branch relationship (GHS-011). 0.3.1: guards against GitHub briefly reporting an older branch head, which could otherwise roll a two-way sync back to old content. 0.3.0: **Protect local**, on by default (above), plus backups of every local file a pull replaces or deletes. 0.2.2: `.gitignore` and `.packagerignore` are always honoured alongside `.ghignore`. 0.2.1, "Safe Sync". 0.2 fixed the filesystem-safety, concurrency and recovery findings from an independent review (GHS-001 to GHS-008); 0.2.1 fixes the one defect found in the follow-up review (GHS-009: temp cleanup could delete user files ending in `.ghsync-tmp`). No new features.
 
-The regression suite in `tests/` runs against an in-memory GitHub, over real HTTP for the CLI, and drives the real GUI offscreen. Every fix has a test that fails on the build before it and passes on 0.2.1. On Windows the suite also creates real NTFS junctions (`mklink /J`, no admin rights needed) and uses the real `msvcrt` lock.
+The regression suite in `tests/` runs against an in-memory GitHub, over real HTTP for the CLI, and drives the real GUI offscreen. Every fix and feature has a test that fails on the build before it and passes on the current one. On Windows the suite also creates real NTFS junctions (`mklink /J`, no admin rights needed) and uses the real `msvcrt` lock.
 
 ```
 run_tests.bat                                   # or: python -m unittest discover -s tests -v
