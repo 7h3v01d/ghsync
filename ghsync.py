@@ -21,7 +21,8 @@ Common flags for push/pull/sync:
   -m "message"   commit message          --dry-run   show plan only
   --yes          skip delete prompts     --prefer local|remote   resolve conflicts
 
-Ignore rules: built-in defaults plus .ghignore (or .gitignore if no .ghignore).
+Ignore rules: built-in defaults plus every one of .ghignore, .gitignore and .packagerignore
+found in the project root. A path matched by any of them is not synced.
 Per-project data lives in .ghsync/ (config + last-synced snapshot).
 
 Safety model (0.2):
@@ -59,7 +60,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 API = os.environ.get("GHSYNC_API", "https://api.github.com")
 STATE_DIR = ".ghsync"
@@ -320,17 +321,50 @@ def blob_sha_file(path, size=None):
         return _hash_open(f, st.st_size if size is None else size)
 
 
+# Every one of these that exists in the project root is honoured; a path matched by any
+# of them is not synced. Each file is read on its own and none is ever written by ghsync.
+IGNORE_FILES = (".ghignore", ".gitignore", ".packagerignore")
+
+
+def ignore_files(root):
+    """The ignore files present in the project root, in IGNORE_FILES order."""
+    return [n for n in IGNORE_FILES if os.path.lexists(os.path.join(root, n))]
+
+
+def _read_ignore_file(root, name):
+    """Patterns from one ignore file. Fails closed: a file that exists but can't be read
+    means exclusions were asked for and would be lost, so the sync must not go ahead."""
+    p = os.path.join(root, name)
+    try:
+        f, _ = _open_regular(p)
+        with f:
+            text = f.read().decode("utf-8-sig")
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeDecodeError, GhsyncError) as e:
+        raise GhsyncError(f"{name} exists but can't be read ({e}). Nothing was synced, because "
+                          f"the files it excludes could otherwise be uploaded. Fix or remove {name} "
+                          "and try again.") from None
+    pats = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("!"):
+            # Force-include (a .packagerignore / .gitignore feature). ghsync never
+            # un-ignores: ignoring more is safe (ignored files are held, never deleted),
+            # un-ignoring could upload something another tool was told to keep private.
+            continue
+        if line.startswith("\\!") or line.startswith("\\#"):
+            line = line[1:]
+        pats.append(line)
+    return pats
+
+
 def load_ignore(root):
     pats = list(DEFAULT_IGNORE)
-    for name in (".ghignore", ".gitignore"):
-        p = os.path.join(root, name)
-        if os.path.exists(p):
-            with open(p, encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#") and not line.startswith("!"):
-                        pats.append(line)
-            break
+    for name in IGNORE_FILES:
+        pats.extend(_read_ignore_file(root, name))
     return pats
 
 
@@ -1113,6 +1147,7 @@ def cmd_status(args):
     snap = gather(root, cfg)
     push, pull, conflict, _ = plan_actions(snap, "sync")
     print(f"{cfg['owner']}/{cfg['repo']} @ {cfg['branch']}  (remote head {snap['remote']['commit'][:7]})")
+    print("Ignore rules: " + (", ".join(ignore_files(root)) or "built-in defaults only"))
     show_plan(snap, push, pull, conflict)
     if conflict:
         print("\nResolve with: diff <path>, then sync --prefer local|remote")
