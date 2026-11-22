@@ -11,6 +11,8 @@ Uploading through github.com stops at 100 files per upload, and checking whether
 ## Features
 
 - **Protect local (on by default).** Your folder is the single source of truth: nothing in it is ever replaced or deleted, and SYNC makes GitHub mirror it. See [Protect local](#protect-local).
+- **Secrets check before every push (0.5).** Files that look like credentials, or contain tokens or private keys, stop the push until you decide. See [Secrets check](#secrets-check).
+- **Clean up GitHub (0.5).** One click removes files your ignore rules exclude but that are still sitting on GitHub (old `*.egg-info`, databases, caches), keeping your local copies.
 - **No git required.** Pure Python standard library (3.8+) for the CLI. Only the GUI needs PyQt6.
 - **No 100-file limit.** Files are uploaded through the GitHub REST API (Git Data endpoints).
 - **Knows who changed what.** A three-way comparison (last synced state, your folder, GitHub) separates "changed here", "changed on GitHub" and "changed on both".
@@ -86,6 +88,41 @@ The override applies to that one run only; protection stays on.
 
 **Turning it off** (two-way sync, where changes made on GitHub are pulled in): `ghsync protect off`, or untick **PROTECT LOCAL** in the GUI, which asks you to confirm. `ghsync protect` shows the current setting, and `status` prints it on every run.
 
+## Secrets check
+
+Before anything is uploaded (PUSH, SYNC, mirror restores, KEEP LOCAL, CLI or window), ghsync checks every file it's about to send:
+
+- **File names that are usually credentials:**
+  - `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.ppk`, `*.keystore`, `*.jks`, `*.kdbx`;
+  - `id_rsa` / `id_ed25519` and similar (not `.pub`);
+  - `.env` and `.env.*` (but not `.env.example` / `.sample` / `.template` / `.dist` / `.defaults`);
+  - `.netrc`, `.pypirc`, `.git-credentials`, `.htpasswd`, `credentials.json`, `key.txt`, `keys.txt`, `token.txt`, `tokens.txt`, `secrets.json` / `.yaml` / `.yml` / `.toml`.
+- **Contents of text files up to 2 MB** that match high-confidence patterns:
+  - GitHub tokens (`ghp_…`, `github_pat_…`);
+  - OpenAI / Anthropic keys (`sk-…`);
+  - AWS access key IDs, Google API keys, Slack tokens, Stripe live keys;
+  - private-key blocks.
+
+If anything matches, **nothing is pushed** and you see each file, line and kind of secret. The secret itself is never shown, only a masked preview such as `ghp_…(40 chars)`.
+
+- In the window, flagged files show as **⚠** in red. The dialog defaults to *Cancel*; *Push anyway* approves those exact files with that exact content. If a flagged file changes after you approve it, the push is refused again.
+- On the command line, `--allow-secrets` pushes anyway, this once.
+- `status` and `--dry-run` list possible secrets without blocking.
+- A file that **can't be read** while it's being checked (open in another program, locked by antivirus, or changed mid-check) is reported as *could not be checked* and blocks the push. Neither *Push anyway* nor `--allow-secrets` covers it, because nothing was actually inspected. Close the file and try again.
+
+It is a safety net, not a guarantee. It deliberately skips fuzzy guesses like `password = …`, which would cry wolf in test code, so it can't catch every secret. Deleting a file is never blocked. Once something is public on GitHub, it stays in the repo's history even after you delete it: rotate any key that was ever pushed.
+
+## Clean up GitHub
+
+Your ignore rules stop files from being synced, but ghsync never deletes ignored files from GitHub on its own. Some may have been pushed before you ignored them (an old `src/pkg.egg-info/`, a `.sqlite3` database, a `key.txt`).
+
+**CLEAN UP** in the window, or `ghsync clean` on the command line, lists every file that your ignore rules exclude but that is still on GitHub, and removes them in one commit after you confirm. `ghsync clean --dry-run` only lists them.
+
+- The copies in your folder are never touched, and GitHub's history keeps the old versions.
+- Only *ignored* files are removed. Symlinks, submodules, names Windows can't hold and other held files are left alone.
+- What you confirm is what runs: the same files, with the same content on GitHub, in the same repository and branch. If any of that changed in between (including a newer version of a listed file), nothing is removed and the list refreshes.
+- The project-list rules apply (no clashing or nested projects).
+
 ## Command reference
 
 Global option: `-C <folder>` runs against a folder other than the current one (put it before the command: `python ghsync.py -C D:\site status`).
@@ -97,6 +134,7 @@ Global option: `-C <folder>` runs against a folder other than the current one (p
 | `link <owner/repo> [--branch NAME]` | Link this folder to an existing repo (default branch unless given). |
 | `status` | Compare folder and repo and show the plan. Changes nothing. |
 | `protect [on\|off]` | Show or change Protect local for this folder. |
+| `clean [--dry-run] [--yes]` | Remove files your ignore rules exclude from GitHub (local copies kept). |
 | `diff [paths...]` | Unified diff, GitHub to local. Binary files just report that they differ. |
 | `push` / `pull` / `sync` | Send local changes, fetch remote changes, or sync. With Protect local on, `sync` mirrors the folder to GitHub and `pull` needs `--allow-local-overwrite`. |
 
@@ -108,6 +146,7 @@ Options for `push`, `pull` and `sync`:
 | `--dry-run` | Print the plan and stop. |
 | `--yes` | Skip the deletion confirmation. |
 | `--prefer local\|remote` | Resolve every conflict in favour of one side (`remote` needs the override while Protect local is on). |
+| `--allow-secrets` | Push files flagged as possible secrets, this once. |
 | `--allow-local-overwrite` | One-time permission to replace or delete files in the folder while Protect local is on. They are backed up first. |
 
 Each sync is one commit containing all the changes. It appears under your GitHub account.
@@ -146,6 +185,7 @@ The left panel lists every project folder you manage. Click one to open it in th
 - **PROTECT LOCAL** (bottom bar, on by default): files GitHub changed show as **⟲ MIRROR** rows and SYNC puts your version back. PULL and KEEP GITHUB become a one-time override that lists the affected files and backs them up first. Unticking it asks for confirmation.
 - **Conflicts:** select the conflicting files and choose **KEEP LOCAL** (overwrite GitHub) or **KEEP GITHUB** (overwrite your copy). Each asks for confirmation.
 - **Deletions** always ask first. The window also refreshes when you click back into it.
+- **Secrets and clean-up:** possible secrets show as **⚠** in red and must be approved before pushing. **CLEAN UP** removes ignored files that are still on GitHub; the status bar tells you when there are any.
 - **Logs stay with their job.** Each background job's output goes only to its own log, even when other work runs at the same time.
 
 ### Tray mode
@@ -230,7 +270,7 @@ Ignore rules apply to both sides. Ignoring a file that was already synced does *
 
 ## Status
 
-0.4.3: tool caches (`.pytest_cache/`, `*.egg-info/`, mypy, ruff, tox, nox, hypothesis, notebook checkpoints) are skipped by default. 0.4.2: the no-nesting rule is enforced by the engine as well, for every entry point (GHS-016). 0.4.1: the one-folder-per-branch rule is enforced by the engine, so the CLI obeys it too (GHS-014); a folder that fails registration can't be opened (GHS-015); the project list is validated on load. The engine's only change since 0.3.4 is that added check. 0.4.0: **multi-project GUI** (above). 0.3.4: fixes a GUI bug where a confirmed SYNC could be silently dropped when closing the confirmation dialog started a refresh. 0.3.3: with Protect local on, PUSH sends your version of conflicts too (before, it left them untouched). 0.3.2: the stale-branch guard fails closed when GitHub can't confirm the branch relationship (GHS-011). 0.3.1: guards against GitHub briefly reporting an older branch head, which could otherwise roll a two-way sync back to old content. 0.3.0: **Protect local**, on by default (above), plus backups of every local file a pull replaces or deletes. 0.2.2: `.gitignore` and `.packagerignore` are always honoured alongside `.ghignore`. 0.2.1, "Safe Sync". 0.2 fixed the filesystem-safety, concurrency and recovery findings from an independent review (GHS-001 to GHS-008); 0.2.1 fixes the one defect found in the follow-up review (GHS-009: temp cleanup could delete user files ending in `.ghsync-tmp`). No new features.
+0.5.1: a file that can't be read during the secrets check now blocks the push instead of counting as clean (GHS-017); a CLEAN UP confirmation is bound to each file's content on GitHub, not only its name (GHS-018). 0.5.0: **secrets check before every push** and **CLEAN UP** for ignored files still on GitHub (above). 0.4.3: tool caches (`.pytest_cache/`, `*.egg-info/`, mypy, ruff, tox, nox, hypothesis, notebook checkpoints) are skipped by default. 0.4.2: the no-nesting rule is enforced by the engine as well, for every entry point (GHS-016). 0.4.1: the one-folder-per-branch rule is enforced by the engine, so the CLI obeys it too (GHS-014); a folder that fails registration can't be opened (GHS-015); the project list is validated on load. The engine's only change since 0.3.4 is that added check. 0.4.0: **multi-project GUI** (above). 0.3.4: fixes a GUI bug where a confirmed SYNC could be silently dropped when closing the confirmation dialog started a refresh. 0.3.3: with Protect local on, PUSH sends your version of conflicts too (before, it left them untouched). 0.3.2: the stale-branch guard fails closed when GitHub can't confirm the branch relationship (GHS-011). 0.3.1: guards against GitHub briefly reporting an older branch head, which could otherwise roll a two-way sync back to old content. 0.3.0: **Protect local**, on by default (above), plus backups of every local file a pull replaces or deletes. 0.2.2: `.gitignore` and `.packagerignore` are always honoured alongside `.ghignore`. 0.2.1, "Safe Sync". 0.2 fixed the filesystem-safety, concurrency and recovery findings from an independent review (GHS-001 to GHS-008); 0.2.1 fixes the one defect found in the follow-up review (GHS-009: temp cleanup could delete user files ending in `.ghsync-tmp`). No new features.
 
 The regression suite in `tests/` runs against an in-memory GitHub, over real HTTP for the CLI, and drives the real GUI offscreen. Every fix and feature has a test that fails on the build before it and passes on the current one. On Windows the suite also creates real NTFS junctions (`mklink /J`, no admin rights needed) and uses the real `msvcrt` lock.
 

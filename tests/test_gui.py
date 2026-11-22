@@ -249,3 +249,108 @@ class TestGuiProtectLocal(TestGuiPlanBinding):
         self.wait_idle()
         self.assertEqual(refreshes_during_dialog, 0)
         self.assertNotIn("junk.txt", self.gh.files())
+
+
+@unittest.skipUnless(HAVE_QT, "PyQt6 not installed")
+class TestGuiSecretsAndClean(TestGuiPlanBinding):
+    """0.5.0 in the real window: secrets dialog before push, CLEAN UP for ignored files."""
+    test_deletion_appearing_after_review_is_not_executed = None
+    test_confirmed_deletion_runs = None
+    test_keep_github_resolution_is_bound = None
+    test_held_files_are_logged = None
+    TOKEN = "gh" + "p_" + "aB3" * 12
+
+    def test_secret_is_flagged_and_cancel_pushes_nothing(self):
+        self.synced({"a.txt": "a"})
+        self.write("settings.py", f"TOKEN = '{self.TOKEN}'")
+        self.open()
+        texts = [self.win.table.item(r, 2).text() for r in range(self.win.table.rowCount())]
+        self.assertIn("⚠ settings.py", texts)
+        self.answer = QMessageBox.StandardButton.Cancel
+        self.win.do_sync("sync")
+        self.wait_idle()
+        self.assertNotIn("settings.py", self.gh.files())
+        self.assertIn("settings.py:1", self.asked[-1])
+        self.assertNotIn(self.TOKEN, self.asked[-1])
+
+    def test_push_anyway_pushes_exactly_what_was_shown(self):
+        self.synced({"a.txt": "a"})
+        self.write("settings.py", f"TOKEN = '{self.TOKEN}'")
+        self.open()
+        self.win.do_sync("push")
+        self.wait_idle()
+        self.assertIn("settings.py", self.gh.files())
+
+    def test_file_changed_after_approval_is_not_pushed(self):
+        self.synced({"a.txt": "a"})
+        self.write("settings.py", f"TOKEN = '{self.TOKEN}'")
+        self.open()
+        real = QMessageBox.exec
+
+        def approve_then_edit(box):
+            self.write("settings.py", f"TOKEN = '{self.TOKEN}'\nKEY = '{'s' + 'k-' + 'Zx9' * 12}'")
+            return QMessageBox.StandardButton.Yes
+        QMessageBox.exec = approve_then_edit
+        try:
+            self.win.do_sync("sync")
+            self.wait_idle()
+        finally:
+            QMessageBox.exec = real
+        self.assertNotIn("settings.py", self.gh.files())
+
+    def test_unchecked_file_cannot_be_pushed_anyway(self):
+        # GHS-017: a file that couldn't be read during the scan gets no "Push anyway".
+        self.synced({"a.txt": "a"})
+        tok = "gh" + "p_" + "Qw7" * 12
+        self.write("settings.py", f"TOKEN = '{tok}'")
+        real = ghsync.read_local
+        fails = [True]
+
+        def flaky(root, rel):
+            if rel == "settings.py" and fails[0]:
+                fails[0] = False
+                raise PermissionError(13, "in use")
+            return real(root, rel)
+        ghsync.read_local = flaky
+        try:
+            self.open()
+        finally:
+            ghsync.read_local = real
+        self.answer = QMessageBox.StandardButton.Yes           # even if the user would say yes
+        self.win.do_sync("sync")
+        self.wait_idle()
+        self.assertNotIn("settings.py", self.gh.files())
+        self.assertIn("could not be checked", self.asked[-1])
+        self.assertNotIn("Push anyway", self.asked[-1])
+
+    def test_clean_up_refuses_a_target_changed_on_github_after_review(self):
+        # GHS-018: same name, newer content -> not the file the user agreed to remove.
+        self.synced({"a.txt": "a"})
+        self.gh.commit_files({"data.sqlite3": b"db v1"}, keep=True)
+        self.write(".ghignore", "*.sqlite3\n.ghignore\n")
+        self.write("data.sqlite3", "local db")
+        self.open()
+        self.gh.commit_files({"data.sqlite3": b"db v2 - never reviewed"}, keep=True)
+        self.answer = QMessageBox.StandardButton.Yes
+        self.win.do_clean()
+        self.wait_idle()
+        self.assertIn("data.sqlite3", self.gh.files())
+        self.assertIn("changed after you", self.win.log.toPlainText())
+
+    def test_clean_up_removes_ignored_files_from_github_only(self):
+        self.synced({"a.txt": "a"})
+        self.gh.commit_files({"pkg.egg-info/PKG-INFO": b"m", "data.sqlite3": b"db"}, keep=True)
+        self.write(".ghignore", "*.sqlite3\n.ghignore\n")
+        self.write("data.sqlite3", "local db")
+        self.open()
+        self.assertTrue(self.win.b_clean.isEnabled())
+        self.answer = QMessageBox.StandardButton.No
+        self.win.do_clean()
+        self.wait_idle()
+        self.assertIn("data.sqlite3", self.gh.files())
+        self.answer = QMessageBox.StandardButton.Yes
+        self.win.do_clean()
+        self.wait_idle()
+        self.assertEqual(set(self.gh.files()), {"a.txt"})
+        self.assertEqual(self.read("data.sqlite3"), b"local db")
+        self.assertFalse(self.win.b_clean.isEnabled())

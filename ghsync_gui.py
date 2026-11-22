@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ghsync  # noqa: E402
 import ghsync_projects as gp  # noqa: E402
 
-APP_VERSION = "0.4.3"      # GUI and engine share the version from 0.4.1
+APP_VERSION = "0.5.1"      # GUI and engine share the version from 0.4.1
 
 from PyQt6.QtCore import QEvent, QPointF, QSettings, Qt, QThread, QTimer, pyqtSignal  # noqa: E402
 from PyQt6.QtGui import (QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap,  # noqa: E402
@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QFrame,  # no
                              QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
                              QProgressBar, QPushButton, QSplitter,
                              QStackedWidget, QSystemTrayIcon, QTableWidget,
-                             QTableWidgetItem, QTableWidgetSelectionRange,
+                             QTableWidgetItem, QTableWidgetSelectionRange, QSizePolicy,
                              QTabWidget, QVBoxLayout, QWidget, QAbstractItemView)
 
 # ------------------------------------------------------------------ palette
@@ -277,7 +277,14 @@ def compute_plan(root):
     # What a two-way pull would do: only reachable through the explicit override.
     _, locked_pull, _, _ = ghsync.plan_actions(snap, "pull") if protect else ({}, {}, {}, [])
     mirror = (ghsync.drift(snap) & set(push)) if protect else set()
-    return dict(root=root, cfg=cfg, snap=snap, base=snap["base"], local=snap["local"], remote=snap["remote"],
+    # Every local file that differs from GitHub could be uploaded by some action: scan them
+    # all (cached by content, so only new or changed files cost anything).
+    rfiles = snap["remote"]["files"]
+    outgoing = {p: sha for p, sha in snap["local"].items()
+                if rfiles.get(p) != sha and p not in snap["held"]}
+    secret_findings = ghsync.find_secrets(root, outgoing)
+    return dict(secrets=secret_findings, clean=ghsync.clean_targets(snap),
+                root=root, cfg=cfg, snap=snap, base=snap["base"], local=snap["local"], remote=snap["remote"],
                 push=push, pull=pull, conflict=conflict, same=len(same),
                 held=ghsync.held_to_show(snap), protect=protect, mirror=mirror,
                 locked_pull=locked_pull)
@@ -368,7 +375,7 @@ class Main(QMainWindow):
         self.setWindowTitle("GHSYNC")
         self.setWindowIcon(make_icon("pending"))
         self.resize(1280, 760)
-        self.setMinimumSize(1020, 560)
+        self.setMinimumHeight(560)          # width: the layout decides, so no button is ever clipped
         self.settings = QSettings("ghsync", "gui")
         self.root = None
         self.projects = []              # registry entries
@@ -472,7 +479,8 @@ class Main(QMainWindow):
         sbl.setContentsMargins(20, 6, 20, 8)
         self.status = QLabel("READY")
         self.status.setStyleSheet(f"color:{MUTED};font-size:10px;font-weight:700;letter-spacing:2px;")
-        sbl.addWidget(self.status)
+        self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        sbl.addWidget(self.status, 1)
         sbl.addStretch(1)
         self.watch_chk = QCheckBox("WATCH FOLDER")
         self.watch_chk.setChecked(self.watch_on)
@@ -610,6 +618,9 @@ class Main(QMainWindow):
         self.b_pull = button("PULL")
         self.b_push = button("PUSH")
         self.b_sync = button("SYNC", "primary")
+        self.b_clean = button("CLEAN UP", "warn", "Remove files your ignore rules exclude from GitHub "
+                                                  "(the copies in this folder are kept)")
+        self.b_clean.clicked.connect(self.do_clean)
         self.b_keep_local.clicked.connect(lambda: self.resolve("local"))
         self.b_keep_remote.clicked.connect(lambda: self.resolve("remote"))
         self.b_diff.clicked.connect(self.diff_selected)
@@ -617,14 +628,19 @@ class Main(QMainWindow):
         self.b_pull.clicked.connect(lambda: self.do_sync("pull"))
         self.b_push.clicked.connect(lambda: self.do_sync("push"))
         self.b_sync.clicked.connect(lambda: self.do_sync("sync"))
-        bar.addWidget(self.msg, 1)
-        for b in (self.b_keep_local, self.b_keep_remote, self.b_diff):
+        lay.addWidget(self.msg)                  # own row: the buttons below never get squeezed
+        for b in (self.b_keep_local, self.b_keep_remote, self.b_diff, self.b_clean):
             bar.addWidget(b)
-        bar.addSpacing(10)
+        bar.addStretch(1)
         for b in (self.b_refresh, self.b_pull, self.b_push, self.b_sync):
             bar.addWidget(b)
+        for b in (self.b_keep_local, self.b_keep_remote, self.b_diff, self.b_clean,
+                  self.b_refresh, self.b_pull, self.b_push, self.b_sync):
+            # never clip a label (the window grows instead); sizeHint ignores the QSS letter-spacing
+            b.setMinimumWidth(b.sizeHint().width() + 2 * len(b.text()) + 8)
+        self.b_clean.setVisible(False)
         lay.addLayout(bar)
-        self.action_widgets = [self.msg, self.b_keep_local, self.b_keep_remote, self.b_diff,
+        self.action_widgets = [self.msg, self.b_keep_local, self.b_keep_remote, self.b_diff, self.b_clean,
                                self.b_refresh, self.b_pull, self.b_push, self.b_sync]
         return page
 
@@ -734,6 +750,7 @@ class Main(QMainWindow):
 
     def set_status(self, text, color=MUTED):
         self.status.setText(text.upper())
+        self.status.setToolTip(text)
         self.status.setStyleSheet(f"color:{color};font-size:10px;font-weight:700;letter-spacing:2px;")
 
     def set_busy(self, busy, text=""):
@@ -764,7 +781,9 @@ class Main(QMainWindow):
         out = []
         for r in rows:
             it = self.table.item(r, 0)
-            out.append((it.data(Qt.ItemDataRole.UserRole), self.table.item(r, 2).text()))
+            pit = self.table.item(r, 2)
+            out.append((it.data(Qt.ItemDataRole.UserRole),
+                        pit.data(Qt.ItemDataRole.UserRole) or pit.text()))
         return out
 
     def update_buttons(self):
@@ -780,6 +799,11 @@ class Main(QMainWindow):
             self.b_pull.setEnabled(bool(self.plan["pull"] or self.plan.get("locked_pull")))
             self.b_push.setEnabled(bool(self.plan["push"]))
             self.b_sync.setEnabled(bool(self.plan["push"] or self.plan["pull"]))
+            self.b_clean.setEnabled(bool(self.plan.get("clean")))
+            self.b_clean.setVisible(bool(self.plan.get("clean")))
+        else:
+            self.b_clean.setEnabled(False)
+            self.b_clean.setVisible(False)
 
     # ---- jobs
     def run_job(self, fn, label, on_ok=None, then_refresh=False, queued=False):
@@ -1112,6 +1136,9 @@ class Main(QMainWindow):
         def tag(new, old):
             return "ADD" if old is None else ("DEL" if new is None else "MOD")
 
+        secret_by_path = {}
+        for f in plan.get("secrets", []):
+            secret_by_path.setdefault(f["path"], []).append(f)
         rows = [("conflict", "CONFLICT", "BOTH", p) for p in sorted(conf)]
         mirror = plan.get("mirror", set())
         rows += [("mirror" if p in mirror else "push", "MIRROR" if p in mirror else "PUSH",
@@ -1133,6 +1160,10 @@ class Main(QMainWindow):
             b = QTableWidgetItem(chg)
             b.setForeground(QColor(chg_color[chg]))
             c = QTableWidgetItem(path)
+            c.setData(Qt.ItemDataRole.UserRole, path)
+            if secret_by_path.get(path) and kind in ("push", "mirror", "conflict"):
+                c.setForeground(QColor(RED))
+                c.setText("⚠ " + path)
             if kind == "mirror":
                 tip = {"ADD": "Deleted on GitHub - your copy will be restored there",
                        "DEL": "Exists only on GitHub - it will be removed there",
@@ -1142,7 +1173,8 @@ class Main(QMainWindow):
             for it in (a, b, c):
                 self.table.setItem(r, (a, b, c).index(it), it)
         for r in range(self.table.rowCount()):
-            if self.table.item(r, 2).text() in keep:
+            pit = self.table.item(r, 2)
+            if (pit.data(Qt.ItemDataRole.UserRole) or pit.text()) in keep:
                 self.table.setRangeSelected(QTableWidgetSelectionRange(r, 0, r, 2), True)
         self.table.setUpdatesEnabled(True)
 
@@ -1157,9 +1189,24 @@ class Main(QMainWindow):
         else:
             self.empty.setText("ALL CLEAR  -  FOLDER AND REPO MATCH")
             self.tstack.setCurrentIndex(1)
+        for r in range(self.table.rowCount()):
+            pit = self.table.item(r, 2)
+            fl = secret_by_path.get(pit.data(Qt.ItemDataRole.UserRole) or "")
+            if fl:
+                pit.setToolTip("Possible secret - pushing would publish it on GitHub:\n"
+                               + ghsync.format_secret_findings(fl))
+        sec = plan.get("secrets", [])
+        sig_s = tuple(sorted((f["path"], f["sha"], f["kind"]) for f in sec))
+        if sec and sig_s != getattr(self, "last_secrets", None):
+            self.log_write(f"\n[secrets] {len(sec)} possible secret(s) in files that differ from GitHub:\n"
+                           + ghsync.format_secret_findings(sec) + "\n", "err")
+        self.last_secrets = sig_s if sec else None
         held = plan["held"]
         if held:
-            self.set_status(f"{len(held)} file(s) held back, not synced - see log", AMBER)
+            if plan.get("clean"):
+                self.set_status(f"{len(plan['clean'])} ignored file(s) still on GitHub - CLEAN UP", AMBER)
+            else:
+                self.set_status(f"{len(held)} file(s) held back, not synced - see log", AMBER)
             sig = tuple(sorted(held.items()))
             if sig != self.last_held:
                 self.last_held = sig
@@ -1221,6 +1268,38 @@ class Main(QMainWindow):
             return True
         return False
 
+    def confirm_secrets(self, push):
+        """None = cancelled; otherwise the exact (path, content) pairs the user approved."""
+        found = [f for f in self.plan.get("secrets", []) if push.get(f["path"]) == f["sha"]]
+        if not found:
+            return set()
+        unchecked = [f for f in found if f.get("unchecked")]
+        if unchecked:                  # nothing was inspected: not something to approve
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Couldn't check for secrets")
+            box.setText(f"{len(unchecked)} file(s) could not be checked for secrets:\n\n"
+                        + ghsync.format_secret_findings(unchecked)
+                        + "\n\nNothing was pushed. Close the file if it's open, then refresh "
+                          "and try again.")
+            box.setStandardButtons(QMessageBox.StandardButton.Ok)
+            box.exec()                 # information only: there is no "push anyway" here
+            return None
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Possible secrets")
+        box.setText(f"{len(found)} possible secret(s) would be published on GitHub:\n\n"
+                    + ghsync.format_secret_findings(found)
+                    + "\n\nOnce public, a secret stays in GitHub's history even if you delete it "
+                      "later. Cancel and remove them (or add the files to .gitignore), or push "
+                      "these exact files anyway?")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+        box.button(QMessageBox.StandardButton.Yes).setText("Push anyway")
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return None
+        return {(f["path"], f["sha"]) for f in found}
+
     def do_sync(self, mode):
         if self.busy or not self.plan or self._blocked():
             return
@@ -1228,6 +1307,9 @@ class Main(QMainWindow):
         push, pull, digest = bound_actions(self.plan, mode, allow=allow)
         self._confirming = True          # closing a dialog must not start a focus refresh
         try:
+            approved = self.confirm_secrets(push)
+            if approved is None:
+                return
             if allow:
                 if not pull or not self.confirm_overwrite(pull):
                     return
@@ -1238,8 +1320,37 @@ class Main(QMainWindow):
         root, message = self.root, self.msg.text().strip() or None
         ns = argparse.Namespace(dir=root, message=message, dry_run=False, yes=True,
                                 prefer=None, resolve=None, only=None, expect=digest,
-                                allow_local_overwrite=allow)
+                                allow_local_overwrite=allow, allow_secrets=approved)
         self.run_job(lambda: ghsync.run_sync(ns, mode), mode.title() + "ing" if mode != "sync" else "Syncing",
+                     on_ok=lambda _: self.msg.clear(), then_refresh=True)
+
+    def do_clean(self):
+        if self.busy or not self.plan or self._blocked():
+            return
+        targets = list(self.plan.get("clean", []))
+        if not targets:
+            return
+        shown = "\n".join(f"  {p}" for p in targets[:12])
+        more = f"\n  ... and {len(targets) - 12} more" if len(targets) > 12 else ""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Clean up GitHub")
+        box.setText(f"Remove {len(targets)} ignored file(s) from GitHub?\n\n{shown}{more}\n\n"
+                    "Your ignore rules exclude these, so syncing never touches them. The copies in "
+                    "this folder are kept, and GitHub's history keeps the old versions.")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        self._confirming = True
+        try:
+            if box.exec() != QMessageBox.StandardButton.Yes:
+                return
+        finally:
+            self._confirming = False
+        ns = argparse.Namespace(dir=self.root, dry_run=False, yes=True,
+                                message=self.msg.text().strip() or None,
+                                expect=ghsync.clean_digest(self.plan["cfg"],
+                                                           self.plan["remote"]["files"], targets))
+        self.run_job(lambda: ghsync.run_clean(ns), "Cleaning up GitHub",
                      on_ok=lambda _: self.msg.clear(), then_refresh=True)
 
     def resolve(self, side):
@@ -1249,9 +1360,12 @@ class Main(QMainWindow):
             return
         resolve_map, only = {p: side for p in sel}, set(sel)
         allow = side == "remote" and self.plan.get("protect", False)
-        _, pull, digest = bound_actions(self.plan, "sync", only=only, resolve=resolve_map, allow=allow)
+        push, pull, digest = bound_actions(self.plan, "sync", only=only, resolve=resolve_map, allow=allow)
         self._confirming = True
         try:
+            approved = self.confirm_secrets(push)
+            if approved is None:
+                return
             if allow:
                 if not self.confirm_overwrite(pull):
                     return
@@ -1266,7 +1380,7 @@ class Main(QMainWindow):
         root, message = self.root, self.msg.text().strip() or None
         ns = argparse.Namespace(dir=root, message=message, dry_run=False, yes=True, prefer=None,
                                 resolve=resolve_map, only=only, expect=digest,
-                                allow_local_overwrite=allow)
+                                allow_local_overwrite=allow, allow_secrets=approved)
         self.run_job(lambda: ghsync.run_sync(ns, "sync"), "Resolving", then_refresh=True)
 
     def diff_selected(self):

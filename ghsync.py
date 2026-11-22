@@ -18,10 +18,12 @@ Commands (run inside your project folder, or use -C <folder>):
   sync                       Protect local ON (default): make GitHub mirror this folder
                              Protect local OFF: pull then push (conflicts reported)
   protect [on|off]           show or change Protect local for this folder
+  clean [--dry-run]          remove files your ignore rules exclude from GitHub (local copies kept)
 
 Common flags for push/pull/sync:
   -m "message"   commit message          --dry-run   show plan only
   --yes          skip delete prompts     --prefer local|remote   resolve conflicts
+  --allow-secrets            push files flagged as possible secrets, this once
   --allow-local-overwrite    one-time permission to replace/delete files in the folder
                              while Protect local is on (they are backed up first)
 
@@ -70,7 +72,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-__version__ = "0.4.3"
+__version__ = "0.5.1"
 
 API = os.environ.get("GHSYNC_API", "https://api.github.com")
 STATE_DIR = ".ghsync"
@@ -139,6 +141,31 @@ class ProtectedLocal(GhsyncError):
 
 class DestinationClash(GhsyncError):
     pass
+
+
+class SecretsFound(GhsyncError):
+    def __init__(self, findings):
+        self.findings = findings
+        super().__init__(
+            f"{len(findings)} possible secret(s) in files about to be pushed:\n"
+            + format_secret_findings(findings)
+            + "\nNothing was pushed. Remove them (or add the files to .gitignore) and try again. "
+              "To push them anyway this once: --allow-secrets on the command line, or confirm "
+              "in the window.")
+
+
+class SecretsUnchecked(SecretsFound):
+    """Files about to be pushed could not be inspected. Never approvable: nothing was seen."""
+
+    def __init__(self, findings):
+        self.findings = findings
+        GhsyncError.__init__(
+            self,
+            f"{len(findings)} file(s) about to be pushed could not be checked for secrets:\n"
+            + format_secret_findings(findings)
+            + "\nNothing was pushed. This is usually a file that was open or still being written. "
+              "Close it and try again. (Approving secrets doesn't cover this, because nothing "
+              "was actually inspected.)")
 
 
 def _projects():
@@ -312,6 +339,115 @@ def check_repo_path(rel):
 
 def _nfc(s):
     return unicodedata.normalize("NFC", s)
+
+
+# ------------------------------------------------------------- secrets check (0.5)
+SECRET_SCAN_MAX = 2 * 1024 * 1024      # content of larger files isn't scanned (names still are)
+_SECRET_PATTERNS = [
+    ("GitHub token", re.compile(
+        r"(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{60,})(?![A-Za-z0-9_])")),
+    ("OpenAI/Anthropic API key", re.compile(
+        r"(?<![A-Za-z0-9_-])sk-(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{32,}")),
+    ("AWS access key", re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Z0-9])")),
+    ("Google API key", re.compile(r"(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])")),
+    ("Slack token", re.compile(r"(?<![A-Za-z0-9])xox[baprs]-[0-9A-Za-z-]{10,}")),
+    ("Stripe live key", re.compile(r"(?<![A-Za-z0-9])(?:sk|rk)_live_[0-9A-Za-z]{24,}")),
+    # assembled so this source line can't match itself
+    ("private key", re.compile("-----BEGIN (?:[A-Z0-9]+ )*PRIV" + "ATE KEY(?: BLOCK)?-----")),
+]
+_SECRET_NAMES = {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".netrc", ".pypirc", ".git-credentials",
+                 ".htpasswd", "credentials.json", "key.txt", "keys.txt", "token.txt", "tokens.txt",
+                 "secrets.json", "secrets.yaml", "secrets.yml", "secrets.toml"}
+# Deliberately not secret.txt / secrets.txt: as often notes as credentials (too noisy).
+_SECRET_GLOBS = ("*.pem", "*.key", "*.p12", "*.pfx", "*.ppk", "*.keystore", "*.jks", "*.kdbx")
+_ENV_TEMPLATES = {".env.example", ".env.sample", ".env.template", ".env.dist", ".env.defaults"}
+_SECRET_CACHE = {}
+
+
+def _secret_name(name):
+    n = name.lower()
+    if n in _SECRET_NAMES:
+        return True
+    if n == ".env" or (n.startswith(".env.") and n not in _ENV_TEMPLATES):
+        return True
+    return any(fnmatch.fnmatch(n, g) for g in _SECRET_GLOBS)
+
+
+def _mask(text):
+    return f"{text[:4]}…({len(text)} chars)"
+
+
+UNCHECKED = "could not be checked"
+
+
+def _scan_one(root, rel, sha):
+    """(findings, verified). verified=False means the content was NOT inspected: never cache
+    that as clean, and never let it through (GHS-017)."""
+    found = []
+    if _secret_name(rel.rsplit("/", 1)[-1]):
+        found.append({"kind": "file name looks like a secret", "line": 0, "preview": ""})
+    try:
+        data = read_local(root, rel)
+    except (OSError, GhsyncError) as e:
+        why = getattr(e, "strerror", None) or type(e).__name__
+        found.append({"kind": f"{UNCHECKED} (read failed: {why})", "line": 0, "preview": "",
+                      "unchecked": True})
+        return found, False
+    if blob_sha_bytes(data) != sha:
+        found.append({"kind": f"{UNCHECKED} (file changed since it was scanned)", "line": 0,
+                      "preview": "", "unchecked": True})
+        return found, False
+    if len(data) > SECRET_SCAN_MAX or b"\0" in data[:8192]:
+        return found, True          # inspected; content deliberately not pattern-scanned
+    text = data.decode("utf-8", "replace")
+    for kind, rx in _SECRET_PATTERNS:
+        for m in rx.finditer(text):
+            line = text.count("\n", 0, m.start()) + 1
+            preview = "-----BEGIN …" if kind == "private key" else _mask(m.group())
+            found.append({"kind": kind, "line": line, "preview": preview})
+            break                                   # one hit per kind per file is enough
+    return found, True
+
+
+def find_secrets(root, items):
+    """Possible secrets in the files of `items` ({path: blob sha}; None = deletion, skipped).
+
+    High-confidence only: credential-shaped file names, and token / private-key patterns
+    in text files up to SECRET_SCAN_MAX. The matched secret itself is never returned,
+    only a masked preview. Results of a successful inspection are cached by content, so
+    rescans are free. A file that could not be inspected gets an "unchecked" finding instead,
+    which is never cached and never approvable.
+    """
+    if len(_SECRET_CACHE) > 50000:
+        _SECRET_CACHE.clear()
+    out = []
+    for rel, sha in sorted(items.items()):
+        if not sha:
+            continue
+        key = (sha, rel.rsplit("/", 1)[-1].lower(), SECRET_SCAN_MAX)
+        found = _SECRET_CACHE.get(key)
+        if found is None:
+            found, verified = _scan_one(root, rel, sha)
+            if verified:
+                _SECRET_CACHE[key] = found
+        out.extend(dict(f, path=rel, sha=sha) for f in found)
+    return out
+
+
+def format_secret_findings(findings):
+    lines = []
+    for f in findings[:60]:
+        where = f"{f['path']}:{f['line']}" if f["line"] else f["path"]
+        lines.append(f"  {where}  -  {f['kind']}" + (f"  ({f['preview']})" if f["preview"] else ""))
+    if len(findings) > 60:
+        lines.append(f"  ... and {len(findings) - 60} more")
+    return "\n".join(lines)
+
+
+def print_secret_findings(findings):
+    if findings:
+        print(f"\nPOSSIBLE SECRETS ({len(findings)}) - these would be published on GitHub:")
+        print(format_secret_findings(findings))
 
 
 # ------------------------------------------------------------- local helpers
@@ -1370,6 +1506,7 @@ def cmd_status(args):
     print("Protect local: " + ("ON - sync makes GitHub mirror this folder; nothing in the folder is "
                                "replaced or deleted" if protect else "OFF - sync is two-way"))
     show_plan(snap, push, pull, conflict, mirror=drift(snap) if protect else ())
+    print_secret_findings(find_secrets(root, {p: v for p, v in push.items() if v}))
     if conflict:
         print("\nResolve with: diff <path>, then sync --prefer local|remote")
 
@@ -1444,8 +1581,19 @@ def _run_sync_locked(args, mode, root, cfg):
         raise PlanChanged("the folder or GitHub changed after you confirmed, so the plan is no "
                           "longer the one you approved. Nothing was done. Review the refreshed "
                           "list and try again.")
+    findings = find_secrets(root, {p: v for p, v in push.items() if v})
+    print_secret_findings(findings)
     if args.dry_run:
         return
+    unchecked = [f for f in findings if f.get("unchecked")]
+    if unchecked:                 # nothing was inspected, so no approval can cover it
+        raise SecretsUnchecked(unchecked)
+    allow_secrets = getattr(args, "allow_secrets", None)
+    if findings and allow_secrets is not True:
+        approved = set(allow_secrets or ())
+        pending = [f for f in findings if (f["path"], f["sha"]) not in approved]
+        if pending:               # checked before anything happens, pull included
+            raise SecretsFound(pending)
     if not (push or pull):
         final = next_base(snap, {}, {})
         if final != snap["base"]:
@@ -1487,6 +1635,62 @@ def _run_sync_locked(args, mode, root, cfg):
           + (f"  {len(conflict)} conflict(s) left untouched." if conflict else "")
           + (f"  {len(failed)} file(s) skipped." if failed else ""))
     return {"pushed": done_push, "pulled": done_pull, "skipped": failed, "conflicts": conflict}
+
+
+def clean_targets(snap):
+    """Files on GitHub that this folder's ignore rules exclude (they'd otherwise stay forever)."""
+    rfiles = snap["remote"]["files"]
+    return sorted(p for p, why in snap["held"].items() if why == "ignored" and p in rfiles)
+
+
+def clean_digest(cfg, remote_files, targets):
+    """Fingerprint of a clean-up: destination, plus each target AND the GitHub content it
+    has now. A target replaced on GitHub after review changes the digest (GHS-018)."""
+    payload = json.dumps({"mode": "clean",
+                          "dest": [cfg["owner"].lower(), cfg["repo"].lower(), cfg["branch"]],
+                          "targets": sorted((p, remote_files.get(p)) for p in targets)},
+                         separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def run_clean(args):
+    """Remove ignored files from GitHub in one commit. Local copies are never touched."""
+    root, cfg = load_cfg(args)
+    with ProjectLock(root):
+        if not args.dry_run:
+            destination_guard(root)
+        snap = gather(root, cfg)
+        targets = clean_targets(snap)
+        print(f"{cfg['owner']}/{cfg['repo']} @ {cfg['branch']}")
+        if not targets:
+            print("\nNothing to clean: no ignored files are on GitHub.")
+            return {"removed": []}
+        print(f"\nIGNORED BUT STILL ON GITHUB ({len(targets)}) - would be removed from GitHub; "
+              "copies in this folder are kept:")
+        for p in targets[:200]:
+            print(f"  {p}")
+        if len(targets) > 200:
+            print(f"  ... and {len(targets) - 200} more")
+        expect = getattr(args, "expect", None)
+        if expect is not None and clean_digest(cfg, snap["remote"]["files"], targets) != expect:
+            raise PlanChanged("the ignored files on GitHub (or their contents) changed after you "
+                              "confirmed. "
+                              "Nothing was removed. Review the refreshed list and try again.")
+        if args.dry_run:
+            return {"removed": [], "would_remove": targets}
+        if not args.yes:
+            if input(f"Remove these {len(targets)} file(s) from GitHub? [y/N] ").strip().lower() != "y":
+                print("Cancelled.")
+                return {"removed": []}
+        msg = getattr(args, "message", None) or f"ghsync: remove {len(targets)} ignored file(s) from GitHub"
+        print("\nRemoving...")
+        new_commit = do_push(root, cfg, {p: None for p in targets}, snap["remote"], msg)
+        state = load_state(root)
+        files = {k: v for k, v in state.get("files", {}).items() if k not in set(targets)}
+        write_json(os.path.join(root, STATE_DIR, "state.json"), {"commit": new_commit, "files": files})
+        print(f"\nDone. Removed {len(targets)} file(s) from GitHub (still in its history). "
+              f"Remote head {new_commit[:7]}.")
+        return {"removed": targets, "commit": new_commit}
 
 
 def _save_token(tok):
@@ -1593,6 +1797,10 @@ def main():
     p.add_argument("repo")
     p.add_argument("--branch")
     sub.add_parser("status")
+    p = sub.add_parser("clean", help="remove files your ignore rules exclude from GitHub")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--yes", action="store_true")
+    p.add_argument("-m", "--message")
     p = sub.add_parser("protect")
     p.add_argument("state", nargs="?", choices=["on", "off"])
     p = sub.add_parser("diff")
@@ -1603,6 +1811,8 @@ def main():
         p.add_argument("--dry-run", action="store_true")
         p.add_argument("--yes", action="store_true")
         p.add_argument("--prefer", choices=["local", "remote"])
+        p.add_argument("--allow-secrets", action="store_true",
+                       help="push files flagged as possible secrets, this once")
         p.add_argument("--allow-local-overwrite", action="store_true",
                        help="one-time permission to replace/delete local files while Protect local is on")
 
@@ -1623,6 +1833,8 @@ def main():
             cmd_status(args)
         elif args.cmd == "protect":
             cmd_protect(args)
+        elif args.cmd == "clean":
+            run_clean(args)
         elif args.cmd == "diff":
             cmd_diff(args)
         else:

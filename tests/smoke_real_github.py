@@ -10,7 +10,7 @@ The repository must already exist with at least one commit (create it on github.
 with "Add a README"). The test adds, changes and deletes files under smoke/ in that
 repo and leaves a few commits behind. Never point it at a repo you care about.
 
-Exit code 0 = every step passed (16 steps).
+Exit code 0 = every step passed (20 steps).
 """
 import argparse
 import base64
@@ -54,6 +54,9 @@ def settle(cfg, sha, timeout=45):
     return False
 
 
+_LAST = {"sync": None, "head": None}    # newest head we caused: by ghsync or behind its back
+
+
 def remote_commit(cfg, files, message):
     """Change the repo behind ghsync's back, like an edit on github.com would."""
     head = ghsync.remote_head(cfg)
@@ -69,6 +72,7 @@ def remote_commit(cfg, files, message):
     t = ghsync.api("POST", ghsync.repo_api(cfg, "/git/trees"), {"base_tree": tree, "tree": entries})["sha"]
     c = ghsync.api("POST", ghsync.repo_api(cfg, "/git/commits"), {"message": message, "tree": t, "parents": [head]})
     ghsync.api("PATCH", ghsync.ref_api(cfg, single=False), {"sha": c["sha"]})
+    _LAST["head"] = c["sha"]
     settle(cfg, c["sha"])
 
 
@@ -105,9 +109,14 @@ def main():
         return st.get("commit")
 
     def remote_files():
-        head = synced_head()
-        if head:
-            settle(cfg, head)       # check against what ghsync last pushed, not a lagging read
+        # Wait for the newest head we caused. That is ghsync's last sync, unless this test has
+        # committed behind ghsync's back since - then ghsync's commit is no longer the head
+        # and waiting for it would only time out (the 45 s warning in 0.5.0's smoke run).
+        sh = synced_head()
+        if sh != _LAST["sync"]:
+            _LAST["sync"] = _LAST["head"] = sh
+        if _LAST["head"]:
+            settle(cfg, _LAST["head"])
         return ghsync.fetch_remote(cfg)["files"]
 
     try:
@@ -194,7 +203,66 @@ def main():
         step("protect: pull refused without override",
              refused and open(path("smoke/a.txt"), "rb").read() == b"local side")
 
-        # 10. Multi-project (0.4.1): a second folder can't take over a registered project's branch
+        # 10. Secrets check (0.5): a fake token is refused before anything is uploaded
+        fake_token = "gh" + "p_" + "sM0k3" * 7 + "x"       # assembled at runtime, never a real token
+        write("smoke/creds.py", f"TOKEN = '{fake_token}'\n".encode())
+        head = ghsync.remote_head(cfg)
+        try:
+            quiet(ghsync.run_sync, ns, "sync")
+            blocked = False
+        except ghsync.SecretsFound as e:
+            blocked = fake_token not in str(e)
+        step("secrets: push with a token refused, nothing uploaded",
+             blocked and ghsync.remote_head(cfg) == head and "smoke/creds.py" not in remote_files())
+        # 10b. GHS-017 (0.5.1): a file that can't be read during the scan is refused, not
+        #      treated as clean - even with --allow-secrets - and nothing is uploaded
+        write("smoke/creds2.py", f"TOKEN = '{fake_token}'\n".encode())
+        real_read, fails = ghsync.read_local, [True]
+
+        def flaky_read(r, rel):
+            if rel == "smoke/creds2.py" and fails[0]:
+                fails[0] = False
+                raise PermissionError(13, "in use (simulated)")
+            return real_read(r, rel)
+        ghsync.read_local = flaky_read
+        try:
+            quiet(ghsync.run_sync, argparse.Namespace(**{**vars(ns), "allow_secrets": True}), "sync")
+            unchecked = False
+        except ghsync.SecretsUnchecked:
+            unchecked = True
+        finally:
+            ghsync.read_local = real_read
+        step("secrets: unreadable file refused even with --allow-secrets",
+             unchecked and ghsync.remote_head(cfg) == head and "smoke/creds2.py" not in remote_files())
+        os.remove(path("smoke/creds.py"))
+        os.remove(path("smoke/creds2.py"))
+
+        # 11. Clean-up (0.5): an ignored file left on GitHub is removed; the local copy stays
+        remote_commit(cfg, {"smoke/pkg.egg-info/PKG-INFO": b"stale metadata"}, "smoke: stale egg-info")
+        write("smoke/pkg.egg-info/PKG-INFO", b"local metadata")
+        # 11a. GHS-018 (0.5.1): approval is bound to GitHub's content, not just the name
+        for _ in range(30):                     # until GitHub's reads show the stale file
+            snap = ghsync.gather(root, cfg)
+            if "smoke/pkg.egg-info/PKG-INFO" in ghsync.clean_targets(snap):
+                break
+            time.sleep(1.5)
+        digest = ghsync.clean_digest(cfg, snap["remote"]["files"], ghsync.clean_targets(snap))
+        remote_commit(cfg, {"smoke/pkg.egg-info/PKG-INFO": b"newer, never reviewed"}, "smoke: egg-info v2")
+        try:
+            quiet(ghsync.run_clean, argparse.Namespace(dir=root, dry_run=False, yes=True, message=None,
+                                                       expect=digest))
+            refused = False
+        except ghsync.PlanChanged:
+            refused = True
+        step("clean: target changed on GitHub after review is refused",
+             refused and "smoke/pkg.egg-info/PKG-INFO" in remote_files())
+        res, _ = quiet(ghsync.run_clean, argparse.Namespace(dir=root, dry_run=False, yes=True, message=None))
+        step("clean: ignored file removed from GitHub, local copy kept",
+             "smoke/pkg.egg-info/PKG-INFO" in res.get("removed", [])
+             and "smoke/pkg.egg-info/PKG-INFO" not in remote_files()
+             and open(path("smoke/pkg.egg-info/PKG-INFO"), "rb").read() == b"local metadata")
+
+        # 12. Multi-project (0.4.1): a second folder can't take over a registered project's branch
         ghsync_projects.add_project(root)
         other = os.path.join(tmp, "second-folder")
         os.makedirs(other)
@@ -202,7 +270,8 @@ def main():
             f.write("must never reach GitHub")
         ghsync.write_json(os.path.join(other, ".ghsync", "config.json"),
                           {"owner": owner, "repo": repo, "branch": cfg["branch"], "protect_local": False})
-        head = ghsync.remote_head(cfg)
+        remote_files()                         # wait until GitHub reports what we last pushed
+        head = synced_head()
         ns2 = argparse.Namespace(**{**vars(ns), "dir": other})
         try:
             quiet(ghsync.run_sync, ns2, "sync")
