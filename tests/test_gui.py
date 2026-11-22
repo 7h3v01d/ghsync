@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 _cfg_home = tempfile.mkdtemp(prefix="ghsync-qtcfg-")
@@ -61,7 +62,8 @@ class TestGuiPlanBinding(Base):
         end = time.time() + timeout
         while time.time() < end:
             self.app.processEvents()
-            if not self.win.busy and not self.win.watch_busy and not self.win._workers:
+            if (not self.win.busy and not self.win.watch_busy and not self.win._workers
+                    and not getattr(self.win, "_queued_action", False)):
                 self.app.processEvents()
                 return
             time.sleep(0.01)
@@ -199,3 +201,49 @@ class TestGuiProtectLocal(TestGuiPlanBinding):
         self.wait_idle()
         self.assertFalse(ghsync.protect_enabled(self.config()))
         self.assertFalse(self.win.plan["protect"])
+
+    def test_push_button_sends_conflicts_shown_in_the_list(self):
+        self.protect(None)
+        self.gh.commit_files({"a.py": b"github a", "b.py": b"github b"})
+        self.write("a.py", "my a")
+        self.write("b.py", "my b")
+        self.open()
+        self.assertEqual(set(self.kinds()), {"a.py", "b.py"})
+        self.win.do_sync("push")
+        self.wait_idle()
+        self.assertEqual(self.gh.files(), {"a.py": b"my a", "b.py": b"my b"})
+
+    def test_confirmed_sync_survives_a_refresh_started_by_closing_the_dialog(self):
+        # Closing the dialog re-activates the window, whose focus-refresh used to start a
+        # scan first; the confirmed sync then found the GUI busy and was silently dropped.
+        self.start({"a.txt": "a"}, {"old/home.js": b"x", "old/scan.js": b"y"})
+
+        def answer_and_refocus(*a, **k):
+            self.asked.append(a[2] if len(a) > 2 else "")
+            self.win.last_refresh = 0
+            self.win.refresh()                      # what window re-activation triggers
+            return QMessageBox.StandardButton.Yes
+        QMessageBox.question = answer_and_refocus
+        self.win.do_sync("sync")
+        self.wait_idle()
+        self.assertEqual(set(self.gh.files()), {"a.txt"})
+        self.assertIn("> SYNCING", self.win.log.toPlainText())
+
+    def test_dialog_closing_does_not_trigger_focus_refresh(self):
+        self.start({"a.txt": "a"}, {"junk.txt": b"x"})
+        self.win.last_refresh = 0
+        scans = []
+        real = self.win.refresh
+        self.win.refresh = lambda: (scans.append(1), real())
+        from PyQt6.QtCore import QEvent
+
+        def answer(*a, **k):
+            self.win.changeEvent(QEvent(QEvent.Type.ActivationChange))
+            return QMessageBox.StandardButton.Yes
+        QMessageBox.question = answer
+        with unittest.mock.patch.object(type(self.win), "isActiveWindow", lambda _: True):
+            self.win.do_sync("sync")
+            refreshes_during_dialog = len(scans)
+        self.wait_idle()
+        self.assertEqual(refreshes_during_dialog, 0)
+        self.assertNotIn("junk.txt", self.gh.files())

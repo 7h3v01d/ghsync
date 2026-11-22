@@ -70,7 +70,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-__version__ = "0.3.2"
+__version__ = "0.3.4"
 
 API = os.environ.get("GHSYNC_API", "https://api.github.com")
 STATE_DIR = ".ghsync"
@@ -999,9 +999,10 @@ def classify(base, local, remote, held=()):
 def plan_actions(snap, mode, only=None, resolve=None, prefer=None, protect=False):
     """The exact push/pull sets a run in `mode` would execute for this snapshot.
 
-    protect=True (Protect local): the pull set is always empty. In sync mode GitHub is
-    made to mirror the folder: everything GitHub changed since the last sync, and every
-    conflict, is pushed as the local version (or deleted on GitHub if it isn't local).
+    protect=True (Protect local): the pull set is always empty and every conflict is
+    pushed as the local version (in push and sync mode). In sync mode GitHub is also made
+    to mirror the folder: everything GitHub changed since the last sync is pushed as the
+    local version (or deleted on GitHub if it isn't local).
     Held paths are never in any set, so ignored or unsafe GitHub files are left alone.
     """
     push, pull, conflict, same = classify(snap["base"], snap["local"], snap["remote"]["files"],
@@ -1024,11 +1025,14 @@ def plan_actions(snap, mode, only=None, resolve=None, prefer=None, protect=False
     elif mode == "pull":
         push = {}
     if protect:
-        if mode == "sync":
-            local = snap["local"]
-            for p in list(pull) + list(conflict):
-                push[p] = local.get(p)
-            conflict = {}
+        local = snap["local"]
+        # The folder is the source of truth, so a conflict is resolved to the local
+        # version by PUSH and SYNC alike. Only SYNC also reverts files that changed on
+        # GitHub alone and removes files that exist only there.
+        mirrored = list(pull) + list(conflict) if mode == "sync" else list(conflict)
+        for p in mirrored:
+            push[p] = local.get(p)
+        conflict = {}
         pull = {}
     return push, pull, conflict, same
 

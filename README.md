@@ -73,7 +73,7 @@ Most of the time the folder on your PC is the real project and GitHub is just wh
 | Changed on both sides | Your version wins | untouched |
 | Ignored, unsafe or otherwise *held* | Left alone on both sides | untouched |
 
-Nothing in the folder is ever replaced or deleted. This is enforced twice: planning never produces a local write, and the code that writes local files refuses to run on its own. PUSH sends only your own changes and leaves GitHub-side edits in place. In the GUI, the files GitHub changed show as **⟲ MIRROR** rows, so you can see exactly what will be reverted or removed before you click SYNC. Mirroring is one commit, so anything it reverts or removes is still in GitHub's history.
+Nothing in the folder is ever replaced or deleted. This is enforced twice: planning never produces a local write, and the code that writes local files refuses to run on its own. PUSH sends your changes, including your version of any conflict, but leaves files changed only on GitHub (and files that exist only there) alone. SYNC does all of that and also reverts and removes those. In the GUI, the files GitHub changed show as **⟲ MIRROR** rows, so you can see exactly what will be reverted or removed before you click SYNC. Mirroring is one commit, so anything it reverts or removes is still in GitHub's history.
 
 **Taking something from GitHub on purpose** needs a one-time override:
 
@@ -211,7 +211,7 @@ Ignore rules apply to both sides. Ignoring a file that was already synced does *
 
 ## Status
 
-0.3.2: the stale-branch guard fails closed when GitHub can't confirm the branch relationship (GHS-011). 0.3.1: guards against GitHub briefly reporting an older branch head, which could otherwise roll a two-way sync back to old content. 0.3.0: **Protect local**, on by default (above), plus backups of every local file a pull replaces or deletes. 0.2.2: `.gitignore` and `.packagerignore` are always honoured alongside `.ghignore`. 0.2.1, "Safe Sync". 0.2 fixed the filesystem-safety, concurrency and recovery findings from an independent review (GHS-001 to GHS-008); 0.2.1 fixes the one defect found in the follow-up review (GHS-009: temp cleanup could delete user files ending in `.ghsync-tmp`). No new features.
+0.3.4: fixes a GUI bug where a confirmed SYNC could be silently dropped when closing the confirmation dialog started a refresh. 0.3.3: with Protect local on, PUSH sends your version of conflicts too (before, it left them untouched). 0.3.2: the stale-branch guard fails closed when GitHub can't confirm the branch relationship (GHS-011). 0.3.1: guards against GitHub briefly reporting an older branch head, which could otherwise roll a two-way sync back to old content. 0.3.0: **Protect local**, on by default (above), plus backups of every local file a pull replaces or deletes. 0.2.2: `.gitignore` and `.packagerignore` are always honoured alongside `.ghignore`. 0.2.1, "Safe Sync". 0.2 fixed the filesystem-safety, concurrency and recovery findings from an independent review (GHS-001 to GHS-008); 0.2.1 fixes the one defect found in the follow-up review (GHS-009: temp cleanup could delete user files ending in `.ghsync-tmp`). No new features.
 
 The regression suite in `tests/` runs against an in-memory GitHub, over real HTTP for the CLI, and drives the real GUI offscreen. Every fix and feature has a test that fails on the build before it and passes on the current one. On Windows the suite also creates real NTFS junctions (`mklink /J`, no admin rights needed) and uses the real `msvcrt` lock.
 

@@ -280,6 +280,8 @@ class Main(QMainWindow):
         self.busy = False
         self.last_refresh = 0.0
         self._workers = set()
+        self._queued_action = False     # a confirmed action waiting for a running job
+        self._confirming = False        # a confirmation dialog is open
         # watcher state
         self.watch_on = self.settings.value("watch", True, type=bool)
         self.watch_busy = False
@@ -632,12 +634,23 @@ class Main(QMainWindow):
             self.b_sync.setEnabled(bool(self.plan["push"] or self.plan["pull"]))
 
     # ---- jobs
-    def run_job(self, fn, label, on_ok=None, then_refresh=False):
-        if self.busy:
+    def run_job(self, fn, label, on_ok=None, then_refresh=False, queued=False):
+        user_action = label != "Scanning"
+        if self.busy or self.watch_busy:
+            if self.busy and not user_action:
+                return                   # a refresh behind other work is pointless
+            if user_action and not queued:
+                # Never drop something the user confirmed: wait for the running job.
+                if self._queued_action:
+                    return               # one waiting action at a time
+                self._queued_action = True
+                if self.busy:
+                    self.log_write(f"\n> {label.upper()} - waiting for the current scan to finish\n", "mark")
+            QTimer.singleShot(150, lambda: self.run_job(fn, label, on_ok, then_refresh,
+                                                        queued=queued or user_action))
             return
-        if self.watch_busy:      # a background poll is mid-flight: retry as soon as it ends
-            QTimer.singleShot(150, lambda: self.run_job(fn, label, on_ok, then_refresh))
-            return
+        if user_action:
+            self._queued_action = False
         self.set_busy(True, label)
         self.log_write(f"\n> {label.upper()}\n", "mark")
         w = Worker(fn)
@@ -828,11 +841,15 @@ class Main(QMainWindow):
             return
         allow = mode == "pull" and self.plan.get("protect", False)
         push, pull, digest = bound_actions(self.plan, mode, allow=allow)
-        if allow:
-            if not pull or not self.confirm_overwrite(pull):
+        self._confirming = True          # closing a dialog must not start a focus refresh
+        try:
+            if allow:
+                if not pull or not self.confirm_overwrite(pull):
+                    return
+            elif not self.confirm_deletes(push, pull):
                 return
-        elif not self.confirm_deletes(push, pull):
-            return
+        finally:
+            self._confirming = False
         root, message = self.root, self.msg.text().strip() or None
         ns = argparse.Namespace(dir=root, message=message, dry_run=False, yes=True,
                                 prefer=None, resolve=None, only=None, expect=digest,
@@ -848,15 +865,19 @@ class Main(QMainWindow):
         resolve_map, only = {p: side for p in sel}, set(sel)
         allow = side == "remote" and self.plan.get("protect", False)
         _, pull, digest = bound_actions(self.plan, "sync", only=only, resolve=resolve_map, allow=allow)
-        if allow:
-            if not self.confirm_overwrite(pull):
-                return
-        else:
-            loser = "GitHub" if side == "local" else "your local copy"
-            if QMessageBox.question(self, "Resolve conflicts",
-                                    f"Keep the {'local' if side == 'local' else 'GitHub'} version of {len(sel)} file(s)?\n\n"
-                                    f"The {loser} will be overwritten.") != QMessageBox.StandardButton.Yes:
-                return
+        self._confirming = True
+        try:
+            if allow:
+                if not self.confirm_overwrite(pull):
+                    return
+            else:
+                loser = "GitHub" if side == "local" else "your local copy"
+                if QMessageBox.question(self, "Resolve conflicts",
+                                        f"Keep the {'local' if side == 'local' else 'GitHub'} version of {len(sel)} file(s)?\n\n"
+                                        f"The {loser} will be overwritten.") != QMessageBox.StandardButton.Yes:
+                    return
+        finally:
+            self._confirming = False
         root, message = self.root, self.msg.text().strip() or None
         ns = argparse.Namespace(dir=root, message=message, dry_run=False, yes=True, prefer=None,
                                 resolve=resolve_map, only=only, expect=digest,
@@ -1171,6 +1192,7 @@ class Main(QMainWindow):
     # ---- window events
     def changeEvent(self, e):
         if (e.type() == QEvent.Type.ActivationChange and self.isActiveWindow() and not self.busy
+                and not self._confirming and not self._queued_action
                 and self.stack.currentIndex() == 1 and time.time() - self.last_refresh > 15):
             self.refresh()
         super().changeEvent(e)

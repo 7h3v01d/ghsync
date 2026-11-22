@@ -127,6 +127,20 @@ class TestProtectedMirror(ProtectBase):
         self.assertEqual(self.gh.files(), {"a.txt": b"local edit", "b.txt": b"github edit"})
         self.assertEqual(self.read("b.txt"), b"b")
 
+    def test_push_sends_local_version_of_conflicts(self):
+        # aether-media case: freshly linked, files differ on both sides (no shared base)
+        self.gh.commit_files({"app/config.py": b"github version", "README.md": b"gh readme",
+                              "only-on-github.md": b"x"})
+        self.write("app/config.py", "my version")
+        self.write("README.md", "my readme")
+        self.write("new.py", "new")
+        with self.no_local_writes():
+            out = self.sync(mode="push")
+        self.assertNotIn("CONFLICT", out)
+        self.assertEqual(self.gh.files(), {"app/config.py": b"my version", "README.md": b"my readme",
+                                           "new.py": b"new", "only-on-github.md": b"x"})
+        self.assertEqual(self.read("app/config.py"), b"my version")
+
     def test_mirror_is_bound_to_the_confirmed_plan(self):
         self.synced_unprotected({"a.txt": "a"})
         root, cfg = ghsync.load_cfg(self.ns())
