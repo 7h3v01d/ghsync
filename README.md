@@ -2,7 +2,7 @@
 
 Keep a local folder and a GitHub repository in sync **without git** and without the 100-file browser upload limit. A single-file command-line tool, plus a dark industrial desktop GUI with a tray watcher that tells you when changes are waiting.
 
-![ghsync GUI showing pending pushes, pulls and a conflict with its diff](docs/screenshot.png)
+![ghsync GUI showing pending pushes, pulls and a conflict with its diff](docs/screensht.png)
 
 ## Why
 
