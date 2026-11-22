@@ -33,6 +33,9 @@ CAN_SYMLINK = hasattr(os, "symlink") and sys.platform != "win32"
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ghsync-test-")
+        # every test gets its own (empty) project list, never the real one in %APPDATA%
+        self._home = os.environ.get("GHSYNC_HOME")
+        os.environ["GHSYNC_HOME"] = os.path.join(self.tmp, "ghsync-home")
         self.root = os.path.join(self.tmp, "proj")
         self.outside = os.path.join(self.tmp, "outside")
         os.makedirs(self.root)
@@ -45,6 +48,10 @@ class Base(unittest.TestCase):
 
     def tearDown(self):
         ghsync.api = self._api
+        if self._home is None:
+            os.environ.pop("GHSYNC_HOME", None)
+        else:
+            os.environ["GHSYNC_HOME"] = self._home
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # ---- helpers

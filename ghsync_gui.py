@@ -12,10 +12,14 @@ import contextlib
 import io
 import os
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ghsync  # noqa: E402
+import ghsync_projects as gp  # noqa: E402
+
+APP_VERSION = "0.4.2"      # GUI and engine share the version from 0.4.1
 
 from PyQt6.QtCore import QEvent, QPointF, QSettings, Qt, QThread, QTimer, pyqtSignal  # noqa: E402
 from PyQt6.QtGui import (QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap,  # noqa: E402
@@ -176,6 +180,74 @@ class Emitter(io.TextIOBase):
         pass
 
 
+class OutputRouter(io.TextIOBase):
+    """Stands in for sys.stdout/sys.stderr and sends each thread's text to that thread's
+    own target. 0.3.4 swapped the process-wide stream for the duration of a job, so text
+    printed by any other thread at the same time landed in that job's log (or vanished)."""
+
+    def __init__(self, fallback):
+        self.fallback = fallback
+        self._tls = threading.local()
+
+    def write(self, s):
+        target = getattr(self._tls, "target", None)
+        if target is None:
+            target = self.fallback
+        if target is None:                     # pythonw: no console at all
+            return len(s or "")
+        try:
+            return target.write(s)
+        except Exception:                      # noqa: BLE001 - output must never break a job
+            return len(s or "")
+
+    def flush(self):
+        target = getattr(self._tls, "target", None) or self.fallback
+        try:
+            if target is not None:
+                target.flush()
+        except Exception:                      # noqa: BLE001
+            pass
+
+    @contextlib.contextmanager
+    def capture(self, target):
+        prev = getattr(self._tls, "target", None)
+        self._tls.target = target
+        try:
+            yield
+        finally:
+            self._tls.target = prev
+
+
+class _Discard(io.TextIOBase):
+    def write(self, s):
+        return len(s or "")
+
+
+_ROUTED = {}
+
+
+def routers():
+    """Install the per-thread routers (idempotent; call from the GUI thread)."""
+    for name in ("stdout", "stderr"):
+        cur = getattr(sys, name)
+        if not isinstance(cur, OutputRouter):
+            cur = OutputRouter(cur)
+            setattr(sys, name, cur)
+        _ROUTED[name] = cur
+    return _ROUTED["stdout"], _ROUTED["stderr"]
+
+
+@contextlib.contextmanager
+def thread_output(out, err):
+    o, e = _ROUTED.get("stdout"), _ROUTED.get("stderr")
+    if o is None or e is None:                 # not installed: fall back to the old behaviour
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            yield
+        return
+    with o.capture(out), e.capture(err):
+        yield
+
+
 class Worker(QThread):
     out = pyqtSignal(str, str)
     result = pyqtSignal(object)
@@ -188,7 +260,7 @@ class Worker(QThread):
     def run(self):
         so, se = Emitter(self.out, "out"), Emitter(self.out, "err")
         try:
-            with contextlib.redirect_stdout(so), contextlib.redirect_stderr(se):
+            with thread_output(so, se):
                 res = self.fn()
             self.result.emit(res)
         except SystemExit:
@@ -205,10 +277,14 @@ def compute_plan(root):
     # What a two-way pull would do: only reachable through the explicit override.
     _, locked_pull, _, _ = ghsync.plan_actions(snap, "pull") if protect else ({}, {}, {}, [])
     mirror = (ghsync.drift(snap) & set(push)) if protect else set()
-    return dict(cfg=cfg, snap=snap, base=snap["base"], local=snap["local"], remote=snap["remote"],
+    return dict(root=root, cfg=cfg, snap=snap, base=snap["base"], local=snap["local"], remote=snap["remote"],
                 push=push, pull=pull, conflict=conflict, same=len(same),
                 held=ghsync.held_to_show(snap), protect=protect, mirror=mirror,
                 locked_pull=locked_pull)
+
+
+def same_root(a, b):
+    return bool(a) and bool(b) and gp.canonical(a)[1] == gp.canonical(b)[1]
 
 
 def bound_actions(plan, mode, only=None, resolve=None, allow=False):
@@ -217,6 +293,22 @@ def bound_actions(plan, mode, only=None, resolve=None, allow=False):
     protect = plan.get("protect", False) and not allow
     push, pull, _, _ = ghsync.plan_actions(plan["snap"], mode, only=only, resolve=resolve, protect=protect)
     return push, pull, ghsync.plan_digest(mode, push, pull)
+
+
+class StatusWorker(QThread):
+    """Dashboard status sweep: one project at a time, read-only, output discarded."""
+    status = pyqtSignal(str, object)
+
+    def __init__(self, items):
+        super().__init__()
+        self.items = items
+
+    def run(self):
+        with thread_output(_Discard(), _Discard()):
+            for i, (pid, root) in enumerate(self.items):
+                self.status.emit(pid, gp.project_status(root))
+                if i < len(self.items) - 1:
+                    time.sleep(0.2)            # gentle on GitHub's rate limit
 
 
 class WatchWorker(QThread):
@@ -230,7 +322,9 @@ class WatchWorker(QThread):
 
     def run(self):
         try:
-            self.done.emit(self.fn())
+            with thread_output(_Discard(), _Discard()):
+                res = self.fn()
+            self.done.emit(res)
         except SystemExit:
             self.failed.emit("not signed in, or folder not linked")
         except Exception as e:            # noqa: BLE001
@@ -266,15 +360,21 @@ def make_icon(state):
 class Main(QMainWindow):
     LOCAL_POLL_MS = 5000      # how often the folder is checked for edits
     REMOTE_EVERY = 12         # check GitHub every N local polls (12 x 5 s = once a minute)
+    STATUS_EVERY_MS = 5 * 60 * 1000   # dashboard sweep of the other projects
 
     def __init__(self, folder=None):
         super().__init__()
+        routers()
         self.setWindowTitle("GHSYNC")
         self.setWindowIcon(make_icon("pending"))
-        self.resize(1040, 720)
-        self.setMinimumSize(820, 560)
+        self.resize(1280, 760)
+        self.setMinimumSize(1020, 560)
         self.settings = QSettings("ghsync", "gui")
-        self.root = os.path.abspath(folder or self.settings.value("folder", os.getcwd()))
+        self.root = None
+        self.projects = []              # registry entries
+        self.statuses = {}              # project id -> project_status() result
+        self._status_busy = False
+        self._status_again = False
         self.plan = None
         self.cfg = None
         self.busy = False
@@ -300,7 +400,11 @@ class Main(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.watch_tick)
         self.timer.start(self.LOCAL_POLL_MS)
-        self.load_folder(self.root)
+        self.status_timer = QTimer(self)
+        self.status_timer.timeout.connect(self.check_all)
+        self.status_timer.start(self.STATUS_EVERY_MS)
+        self.load_folder(self._initial_root(folder))
+        self.check_all()
 
     # ---- layout
     def _build(self):
@@ -331,21 +435,26 @@ class Main(QMainWindow):
         head.addWidget(self.pill)
         body.addLayout(head)
 
+        split_h = QHBoxLayout()
+        split_h.setSpacing(16)
+        body.addLayout(split_h, 1)
+        split_h.addWidget(self._sidebar())
+        right = QVBoxLayout()
+        right.setSpacing(12)
+        split_h.addLayout(right, 1)
+
         # folder bar
         frow = QHBoxLayout()
         frow.setSpacing(8)
         self.folder_edit = QLineEdit()
         self.folder_edit.setReadOnly(True)
         self.folder_edit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        browse = button("BROWSE")
-        browse.clicked.connect(self.browse)
         frow.addWidget(caption("FOLDER"))
         frow.addWidget(self.folder_edit, 1)
-        frow.addWidget(browse)
-        body.addLayout(frow)
+        right.addLayout(frow)
 
         self.stack = QStackedWidget()
-        body.addWidget(self.stack, 1)
+        right.addWidget(self.stack, 1)
         self.stack.addWidget(self._connect_page())
         self.stack.addWidget(self._main_page())
 
@@ -388,6 +497,43 @@ class Main(QMainWindow):
         sbl.addWidget(hint)
         foot.addWidget(sb)
         outer.addLayout(foot)
+
+    def _sidebar(self):
+        box = QWidget()
+        box.setFixedWidth(300)
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        lay.addWidget(caption("PROJECTS"))
+        t = self.proj_table = QTableWidget(0, 2)
+        t.setHorizontalHeaderLabels(["PROJECT", "STATUS"])
+        t.verticalHeader().setVisible(False)
+        t.verticalHeader().setDefaultSectionSize(26)
+        t.setShowGrid(False)
+        t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        t.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        hh = t.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setHighlightSections(False)
+        hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        t.cellClicked.connect(self._project_clicked)
+        lay.addWidget(t, 1)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.b_add = button("ADD", tip="Add a project folder to the list")
+        self.b_remove = button("REMOVE", tip="Remove the selected project from the list. "
+                                             "Its folder and GitHub repo are not touched.")
+        self.b_check = button("CHECK ALL", tip="Check every project's status now "
+                                               "(one GitHub request per project)")
+        self.b_add.clicked.connect(self.browse)
+        self.b_remove.clicked.connect(lambda: self.remove_project_root(self._selected_project_root()))
+        self.b_check.clicked.connect(self.check_all)
+        for b in (self.b_add, self.b_remove, self.b_check):
+            row.addWidget(b)
+        lay.addLayout(row)
+        return box
 
     def _main_page(self):
         page = QWidget()
@@ -578,7 +724,7 @@ class Main(QMainWindow):
         return bool(os.environ.get("GITHUB_TOKEN")) or os.path.exists(ghsync.TOKEN_FILE)
 
     def cfg_path(self):
-        return os.path.join(self.root, ghsync.STATE_DIR, "config.json")
+        return os.path.join(self.root or "", ghsync.STATE_DIR, "config.json")
 
     def set_pill(self, text, color):
         self.pill.setText(text)
@@ -596,6 +742,8 @@ class Main(QMainWindow):
         self.progress.setValue(0)
         for w in self.action_widgets:
             w.setEnabled(not busy)
+        self.b_add.setEnabled(not busy)
+        self._render_projects()
         if busy:
             self.set_status(text, AMBER)
         else:
@@ -681,14 +829,231 @@ class Main(QMainWindow):
 
     # ---- folder / state
     def browse(self):
-        if self.busy:
+        if self.busy or self._queued_action:
             return
-        d = QFileDialog.getExistingDirectory(self, "Choose project folder", self.root)
-        if d:
-            self.load_folder(os.path.abspath(d))
+        d = QFileDialog.getExistingDirectory(self, "Add project folder", self.root or os.getcwd())
+        if not d:
+            return
+        entry = self._registered(d) or self.add_project_path(d)
+        if entry:
+            self.select_project_root(entry["root"])
+
+    # ---- projects
+    def _safe_registry(self):
+        try:
+            return gp.load_registry()
+        except gp.RegistryError as e:
+            self.log_write(f"\n[projects] {e}\n", "err")
+            return None
+
+    def _registered(self, root):
+        return gp.find(self.projects, root) if root else None
+
+    def _initial_root(self, folder):
+        entries = self._safe_registry() or []
+        if folder and not gp.find(entries, folder):
+            if not self.add_project_path(folder, sweep=False):
+                folder = None            # GHS-015: a folder the registry rejected never becomes active
+        if not entries and not self.settings.value("migrated", False, type=bool):
+            old = self.settings.value("folder", "")      # 0.3.x remembered a single folder
+            if old and os.path.isdir(os.path.join(old, ghsync.STATE_DIR)):
+                self.add_project_path(old, sweep=False)
+            self.settings.setValue("migrated", True)
+        self.reload_projects()
+        if folder:
+            return gp.canonical(folder)[0]
+        last = self.settings.value("folder", "")
+        if last and self._registered(last):
+            return gp.canonical(last)[0]
+        if self.projects:
+            return self.projects[0]["root"]
+        return None                      # nothing registered: empty state, use ADD
+
+    def reload_projects(self):
+        entries = self._safe_registry()
+        if entries is not None:
+            self.projects = entries
+        self.statuses = {k: v for k, v in self.statuses.items() if any(e["id"] == k for e in self.projects)}
+        self._render_projects()
+
+    STATUS_TEXT = {"clean": ("IN SYNC", GREEN), "remote": ("GITHUB CHANGED", BLUE),
+                   "both": ("BOTH CHANGED", AMBER), "new": ("NEVER SYNCED", AMBER),
+                   "unlinked": ("NOT LINKED", MUTED), "error": ("ERROR", RED)}
+
+    def _status_label(self, entry, clash_ids):
+        if entry["id"] in clash_ids:
+            return "CLASH", RED, "Another project in the list syncs to the same repo and branch."
+        st = self.statuses.get(entry["id"])
+        if not st:
+            return "…", MUTED, "Not checked yet"
+        tip = st.get("repo") or ""
+        if st.get("error"):
+            tip = st["error"]
+        if st.get("plan_text"):
+            return st["plan_text"], st.get("plan_color", AMBER), tip
+        if st["state"] == "local":
+            n = st["local_changes"]
+            return f"{n} LOCAL CHANGE{'S' if n != 1 else ''}", AMBER, tip
+        text, color = self.STATUS_TEXT.get(st["state"], ("?", MUTED))
+        return text, color, tip
+
+    def _render_projects(self):
+        t = self.proj_table
+        clash_ids = gp.clashes(self.projects)
+        t.blockSignals(True)
+        t.setRowCount(len(self.projects))
+        current = None
+        for r, e in enumerate(self.projects):
+            name = QTableWidgetItem(e["name"])
+            name.setToolTip(e["root"])
+            name.setData(Qt.ItemDataRole.UserRole, e["root"])
+            text, color, tip = self._status_label(e, clash_ids)
+            stat = QTableWidgetItem(text)
+            stat.setForeground(QColor(color))
+            stat.setToolTip(tip)
+            t.setItem(r, 0, name)
+            t.setItem(r, 1, stat)
+            if self.root and same_root(e["root"], self.root):
+                current = r
+        if current is not None:
+            t.selectRow(current)
+        else:
+            t.clearSelection()
+        t.blockSignals(False)
+        self.b_remove.setEnabled(current is not None and not self.busy)
+
+    def _selected_project_root(self):
+        rows = {i.row() for i in self.proj_table.selectedItems()}
+        if not rows:
+            return None
+        return self.proj_table.item(min(rows), 0).data(Qt.ItemDataRole.UserRole)
+
+    def _project_clicked(self, row, _col):
+        root = self.proj_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        self.select_project_root(root)
+
+    def add_project_path(self, path, select=False, sweep=True):
+        """Register a folder. Returns the entry, or None (the reason is logged)."""
+        try:
+            entry = gp.add_project(path)
+        except gp.RegistryError as e:
+            self.log_write(f"\n[projects] Can't add {path}: {e}\n", "err")
+            self.set_status("Project not added - see log", RED)
+            self._render_projects()
+            return None
+        self.log_write(f"\n[projects] Added '{entry['name']}' ({entry['root']}).\n", "mark")
+        self.reload_projects()
+        if select:
+            self.select_project_root(entry["root"])
+        elif sweep:
+            self.check_all()
+        return entry
+
+    def remove_project_root(self, root):
+        entry = self._registered(root)
+        if not entry:
+            return
+        if self.busy or self._queued_action:
+            self.set_status("Wait for the current operation to finish", AMBER)
+            return
+        if QMessageBox.question(self, "Remove project",
+                                f"Remove '{entry['name']}' from the list?\n\n{entry['root']}\n\n"
+                                "Its folder, its .ghsync settings and its GitHub repo are not touched; "
+                                "you can add it again at any time.") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            gp.remove_project(entry["id"])
+        except gp.RegistryError as e:
+            self.log_write(f"\n[projects] {e}\n", "err")
+            return
+        self.log_write(f"\n[projects] Removed '{entry['name']}' from the list (files untouched).\n", "mark")
+        was_current = same_root(entry["root"], self.root)
+        self.reload_projects()
+        if was_current:
+            self.load_folder(self.projects[0]["root"] if self.projects else None)
+
+    def select_project_root(self, root):
+        if not root or same_root(root, self.root):
+            self._render_projects()
+            return
+        if self.busy or self._queued_action:
+            # A sync/push/pull belongs to the open project: never switch underneath it.
+            self.set_status("Wait for the current operation to finish before switching", AMBER)
+            self._render_projects()
+            return
+        self.load_folder(gp.canonical(root)[0])
+
+    def check_all(self):
+        """Sweep the other projects' status in the background (the open one is live already)."""
+        if self._status_busy:
+            self._status_again = True
+            return
+        if not self.root:
+            return                       # nothing open yet: the startup sweep comes later
+        items = [(e["id"], e["root"]) for e in self.projects if not same_root(e["root"], self.root)]
+        if not items:
+            return
+        self._status_busy = True
+        w = StatusWorker(items)
+        self._workers.add(w)
+        w.status.connect(self._status_result)
+        w.finished.connect(lambda: (self._workers.discard(w), self._status_done()))
+        w.start()
+
+    def _status_result(self, pid, st):
+        entry = next((e for e in self.projects if e["id"] == pid), None)
+        if entry and self._is_current(entry["root"]):
+            return                       # the open project's live view is authoritative
+        self.statuses[pid] = st
+        self._render_projects()
+
+    def _status_done(self):
+        self._status_busy = False
+        if self._status_again:
+            self._status_again = False
+            self.check_all()
+
+    def _set_current_status_from_plan(self, plan):
+        entry = self._registered(plan.get("root"))
+        if not entry:
+            return
+        n_conf = len(plan["conflict"])
+        n = len(plan["push"]) + len(plan["pull"])
+        if n_conf:
+            text, color = f"{n_conf} CONFLICT{'S' if n_conf != 1 else ''}", RED
+        elif n:
+            text, color = f"{n} PENDING", AMBER
+        else:
+            text, color = "IN SYNC", GREEN
+        self.statuses[entry["id"]] = {"state": "live", "plan_text": text, "plan_color": color,
+                                      "repo": f"{plan['cfg']['owner']}/{plan['cfg']['repo']} · "
+                                              f"{plan['cfg']['branch']}"}
+        self._render_projects()
+
+    def _show_no_project(self):
+        self.cfg, self.plan = None, None
+        self.folder_edit.setText("")
+        self.table.setRowCount(0)
+        self.show_protect(None)
+        self.repo_lbl.setText("")
+        self.set_pill("", MUTED)
+        self.token_card.setVisible(not self.has_token())
+        self.setup_row.setVisible(False)
+        self.c_title.setText("NO PROJECT OPEN")
+        self.c_sub.setText("Use ADD (left) to add a project folder to the list.")
+        self.stack.setCurrentIndex(0)
+        self.update_tray()
+        self._render_projects()
+        self.set_status("No project", MUTED)
+
+    def _is_current(self, root):
+        return same_root(root, self.root)
 
     def load_folder(self, root):
         self.root = root
+        if root is None:
+            self._show_no_project()
+            return
         self.settings.setValue("folder", root)
         self.folder_edit.setText(root)
         self.plan = None
@@ -698,6 +1063,10 @@ class Main(QMainWindow):
         self.cfg = cfg
         self.show_protect(cfg)
         self.update_tray()
+        self._render_projects()
+        clash = gp.clash_message(root) if cfg else None
+        if clash:
+            self.log_write(f"\n[projects] Syncing is blocked for this folder: {clash}\n", "err")
         if cfg and self.has_token():
             self.repo_lbl.setText(f"{cfg['owner']}/{cfg['repo']}  ·  {cfg['branch']}")
             self.stack.setCurrentIndex(1)
@@ -725,6 +1094,8 @@ class Main(QMainWindow):
         self.run_job(lambda: compute_plan(root), "Scanning", on_ok=self.apply_plan)
 
     def apply_plan(self, plan, notify=False):
+        if not self._is_current(plan.get("root")):
+            return                       # a scan of a project that is no longer open
         keep = {p for _, p in self.selected_rows()}      # keep the user's selection across refreshes
         self.plan = plan
         self.last_local = dict(plan["local"])
@@ -800,6 +1171,7 @@ class Main(QMainWindow):
         self.update_buttons()
         self.update_tray()
         self.after_plan(notify)
+        self._set_current_status_from_plan(plan)
 
     # ---- actions
     def confirm_deletes(self, push, pull):
@@ -836,8 +1208,21 @@ class Main(QMainWindow):
         box.setDefaultButton(QMessageBox.StandardButton.No)
         return box.exec() == QMessageBox.StandardButton.Yes
 
+    def _blocked(self):
+        """Refuse a mutating action on a stale plan or a project with a destination clash."""
+        if not self.plan or not self._is_current(self.plan.get("root")):
+            return True
+        msg = gp.clash_message(self.root)
+        if msg:
+            self.log_write(f"\nSync blocked: {msg}\n", "err")
+            self.set_status("Blocked - see log", RED)
+            if self.stack.currentIndex() == 1:
+                self.tabs.setCurrentIndex(0)
+            return True
+        return False
+
     def do_sync(self, mode):
-        if self.busy or not self.plan:
+        if self.busy or not self.plan or self._blocked():
             return
         allow = mode == "pull" and self.plan.get("protect", False)
         push, pull, digest = bound_actions(self.plan, mode, allow=allow)
@@ -860,7 +1245,7 @@ class Main(QMainWindow):
     def resolve(self, side):
         kinds = ("conflict", "mirror") if side == "remote" else ("conflict",)
         sel = [p for d, p in self.selected_rows() if d in kinds]
-        if self.busy or not sel or not self.plan:
+        if self.busy or not sel or not self.plan or self._blocked():
             return
         resolve_map, only = {p: side for p in sel}, set(sel)
         allow = side == "remote" and self.plan.get("protect", False)
@@ -948,27 +1333,42 @@ class Main(QMainWindow):
 
     def do_create(self):
         name = self.new_name.text().strip()
-        if self.busy or not name:
+        if self.busy or not name or not self.root:
             return
         if not self.has_token():
             self.set_status("Save your token first", RED)
             return
         ns = argparse.Namespace(dir=self.root, name=name, public=self.public_chk.isChecked(),
                                 org=None, description=None, message=None)
+        root = self.root
         self.run_job(lambda: ghsync.cmd_init(ns), "Creating repo and uploading",
-                     on_ok=lambda _: self.load_folder(self.root))
+                     on_ok=lambda _: self._linked(root))
+
+    def _linked(self, root):
+        if not self._registered(root):
+            self.add_project_path(root)
+        if self._is_current(root):
+            self.load_folder(root)
 
     def do_link(self):
         repo = self.link_name.text().strip()
+        if not self.root:
+            return
         if self.busy or "/" not in repo:
             self.set_status("Use owner/repo", RED)
             return
         if not self.has_token():
             self.set_status("Save your token first", RED)
             return
-        ns = argparse.Namespace(dir=self.root, repo=repo, branch=None)
-        self.run_job(lambda: ghsync.cmd_link(ns), "Linking",
-                     on_ok=lambda _: self.load_folder(self.root))
+        root = self.root
+        owner, name = repo.split("/", 1)
+
+        def job():
+            info = ghsync.api("GET", ghsync.repo_api({"owner": owner, "repo": name}))
+            branch = info["default_branch"]
+            gp.check_destination(root, owner, name, branch)    # refuse before writing config
+            ghsync.cmd_link(argparse.Namespace(dir=root, repo=repo, branch=branch))
+        self.run_job(job, "Linking", on_ok=lambda _: self._linked(root))
 
     # ---- tray + background watcher
     def _build_tray(self):
@@ -1132,7 +1532,8 @@ class Main(QMainWindow):
         w = WatchWorker(fn)
         self._workers.add(w)
         w.done.connect(on_done)
-        w.failed.connect(self._watch_failed)
+        root = self.root
+        w.failed.connect(lambda msg: self._watch_failed(msg, root))
         w.finished.connect(lambda: self._workers.discard(w))
         w.start()
 
@@ -1149,13 +1550,15 @@ class Main(QMainWindow):
             head = None
             if check_remote:
                 head = ghsync.remote_head(cfg)
-            return local, head
+            return root, local, head
 
         self._start_watch_job(job, self._tick_done)
 
     def _tick_done(self, res):
         self.watch_busy = False
-        local, head = res
+        root, local, head = res
+        if not self._is_current(root):
+            return                       # the user switched project while this poll ran
         recovered = False
         if head is not None and self.watch_error:
             self.watch_error, recovered = None, True
@@ -1179,11 +1582,15 @@ class Main(QMainWindow):
 
     def _watch_plan(self, plan):
         self.watch_busy = False
+        if not self._is_current(plan.get("root")):
+            return
         self.last_refresh = time.time()
         self.apply_plan(plan, notify=True)
 
-    def _watch_failed(self, msg):
+    def _watch_failed(self, msg, root=None):
         self.watch_busy = False
+        if root and not self._is_current(root):
+            return
         if msg != self.watch_error:
             self.watch_error = msg
             self.log_write(f"\n[watch] {msg}\n", "err")

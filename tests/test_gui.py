@@ -43,6 +43,7 @@ class TestGuiPlanBinding(Base):
     def setUp(self):
         super().setUp()
         os.environ["GITHUB_TOKEN"] = "test-token"
+        os.environ["GHSYNC_HOME"] = os.path.join(self.tmp, "ghsync-home")   # per-test project list
         self.asked = []
         self._q, self._exec = QMessageBox.question, QMessageBox.exec
         self.answer = QMessageBox.StandardButton.Yes
@@ -63,7 +64,8 @@ class TestGuiPlanBinding(Base):
         while time.time() < end:
             self.app.processEvents()
             if (not self.win.busy and not self.win.watch_busy and not self.win._workers
-                    and not getattr(self.win, "_queued_action", False)):
+                    and not getattr(self.win, "_queued_action", False)
+                    and not getattr(self.win, "_status_busy", False)):
                 self.app.processEvents()
                 return
             time.sleep(0.01)

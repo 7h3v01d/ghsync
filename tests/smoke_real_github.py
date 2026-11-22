@@ -10,7 +10,7 @@ The repository must already exist with at least one commit (create it on github.
 with "Add a README"). The test adds, changes and deletes files under smoke/ in that
 repo and leaves a few commits behind. Never point it at a repo you care about.
 
-Exit code 0 = every step passed (14 steps).
+Exit code 0 = every step passed (16 steps).
 """
 import argparse
 import base64
@@ -23,7 +23,11 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Use a throwaway project list so the real one (%APPDATA%\ghsync\projects.json) is never touched.
+_SMOKE_HOME = tempfile.mkdtemp(prefix="ghsync-smoke-home-")
+os.environ["GHSYNC_HOME"] = _SMOKE_HOME
 import ghsync  # noqa: E402
+import ghsync_projects  # noqa: E402
 
 RESULTS = []
 
@@ -190,12 +194,38 @@ def main():
         step("protect: pull refused without override",
              refused and open(path("smoke/a.txt"), "rb").read() == b"local side")
 
+        # 10. Multi-project (0.4.1): a second folder can't take over a registered project's branch
+        ghsync_projects.add_project(root)
+        other = os.path.join(tmp, "second-folder")
+        os.makedirs(other)
+        with open(os.path.join(other, "intruder.txt"), "w") as f:
+            f.write("must never reach GitHub")
+        ghsync.write_json(os.path.join(other, ".ghsync", "config.json"),
+                          {"owner": owner, "repo": repo, "branch": cfg["branch"], "protect_local": False})
+        head = ghsync.remote_head(cfg)
+        ns2 = argparse.Namespace(**{**vars(ns), "dir": other})
+        try:
+            quiet(ghsync.run_sync, ns2, "sync")
+            refused = False
+        except ghsync.DestinationClash:
+            refused = True
+        step("multi: second folder on the same branch refused (engine)",
+             refused and ghsync.remote_head(cfg) == head)
+        import subprocess
+        r = subprocess.run([sys.executable, "-I", os.path.join(os.path.dirname(ghsync.__file__), "ghsync.py"),
+                            "-C", other, "sync", "--yes"], capture_output=True, text=True, timeout=120,
+                           env=dict(os.environ))
+        step("multi: ...and refused through the CLI",
+             r.returncode != 0 and "also syncs to" in r.stderr and ghsync.remote_head(cfg) == head
+             and "intruder.txt" not in ghsync.fetch_remote(cfg)["files"], r.stderr.strip()[-300:])
+
         # clean up what the smoke test added
         remote_commit(cfg, {p: None for p in ghsync.fetch_remote(cfg)["files"]
                             if p.startswith(("smoke/", ".ghsync/"))},
                       "smoke: cleanup")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(_SMOKE_HOME, ignore_errors=True)
 
     print(f"\n{sum(RESULTS)}/{len(RESULTS)} steps passed")
     sys.exit(0 if all(RESULTS) else 1)

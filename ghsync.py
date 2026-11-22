@@ -70,7 +70,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-__version__ = "0.3.4"
+__version__ = "0.4.2"
 
 API = os.environ.get("GHSYNC_API", "https://api.github.com")
 STATE_DIR = ".ghsync"
@@ -130,6 +130,73 @@ class PlanChanged(GhsyncError):
 
 class ProtectedLocal(GhsyncError):
     pass
+
+
+class DestinationClash(GhsyncError):
+    pass
+
+
+def _projects():
+    """The project registry module (ghsync_projects.py, shipped alongside), or None.
+
+    When this file runs as a script it is __main__; alias it as 'ghsync' first so the
+    registry module imports *this* module rather than a second copy of it.
+    """
+    sys.modules.setdefault("ghsync", sys.modules[__name__])
+    mod = sys.modules.get("ghsync_projects")
+    if mod is not None:
+        return mod
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ghsync_projects.py")
+    if not os.path.exists(path):
+        return None              # engine used on its own (0.3.x layout): no project registry
+    # Load by explicit path: works however Python was started (e.g. `python -I`, which
+    # leaves the script's folder off sys.path). A present but broken module fails closed.
+    import importlib.util
+    try:
+        spec = importlib.util.spec_from_file_location("ghsync_projects", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["ghsync_projects"] = mod
+        spec.loader.exec_module(mod)
+    except Exception as e:  # noqa: BLE001
+        sys.modules.pop("ghsync_projects", None)
+        raise DestinationClash(f"the project registry module couldn't be loaded ({e}); "
+                               "refusing to sync until it can be checked") from None
+    return mod
+
+
+def nesting_guard(root):
+    """GHS-016: refuse a folder nested inside, or containing, a listed project."""
+    gp = _projects()
+    if gp is None:
+        return
+    msg = gp.overlap_message(root)
+    if msg:
+        raise DestinationClash(msg)
+
+
+def destination_guard(root, owner=None, repo=None, branch=None):
+    """GHS-014: refuse if another registered project owns this repo + branch.
+    GHS-016: refuse if this folder is nested inside, or contains, a listed project.
+
+    Enforced here, at the operation boundary, so the CLI obeys the same rule as the GUI.
+    With owner/repo/branch it checks a destination about to be linked; without, the
+    folder's current config. Reads the registry snapshot (written atomically) without
+    taking the registry lock, so no lock ordering exists between the two kinds of lock.
+    A damaged registry fails closed. No registry module or file: no restriction.
+    """
+    gp = _projects()
+    if gp is None:
+        return
+    nesting_guard(root)
+    if owner is not None:
+        try:
+            gp.check_destination(root, owner, repo, branch)
+        except gp.RegistryError as e:
+            raise DestinationClash(str(e)) from None
+        return
+    msg = gp.clash_message(root)
+    if msg:
+        raise DestinationClash(msg)
 
 
 _PROTECT_HELP = ("Protect local is on for this folder, so ghsync won't replace or delete files in it. "
@@ -1347,6 +1414,8 @@ def run_sync(args, mode):
 
 def _run_sync_locked(args, mode, root, cfg):
     state_path = os.path.join(root, STATE_DIR, "state.json")
+    if not args.dry_run:
+        destination_guard(root)        # under the project lock, before any GitHub request
     allow = bool(getattr(args, "allow_local_overwrite", False))
     protect = protect_enabled(cfg) and not allow
     resolve = getattr(args, "resolve", None) or {}
@@ -1476,8 +1545,10 @@ def cmd_link(args):
         die("use owner/repo")
     owner, repo = args.repo.strip().split("/", 1)
     validate_cfg({"owner": owner, "repo": repo, "branch": "main"})
+    nesting_guard(root)                               # no network needed: check first
     info = api("GET", repo_api({"owner": owner, "repo": repo}))
     branch = args.branch or info["default_branch"]
+    destination_guard(root, owner, repo, branch)      # before anything is written
     save_cfg(root, owner, repo, branch)
     print(f"Linked {root} -> {owner}/{repo} ({branch}).")
     print("Run 'status' to compare. Files that exist on both sides with different content show as CONFLICT.")
@@ -1488,10 +1559,12 @@ def cmd_init(args):
     body = {"name": args.name, "private": not args.public, "auto_init": True,
             "description": args.description or ""}
     path = f"/orgs/{urllib.parse.quote(args.org, safe='')}/repos" if args.org else "/user/repos"
+    nesting_guard(root)                               # before creating anything on GitHub
     try:
         info = api("POST", path, body)
     except ApiError as e:
         die(f"could not create repo: {e}")
+    destination_guard(root, info["owner"]["login"], info["name"], info["default_branch"])
     save_cfg(root, info["owner"]["login"], info["name"], info["default_branch"])
     print(f"Created {info['full_name']} ({'public' if args.public else 'private'}).")
     args.message, args.dry_run, args.yes, args.prefer = args.message or "Initial upload via ghsync", False, True, None

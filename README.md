@@ -115,12 +115,30 @@ Each sync is one commit containing all the changes. It appears under your GitHub
 ## The GUI
 
 ```
-python ghsync_gui.py                      # opens the last folder you used
-python ghsync_gui.py C:\Projects\my-site  # opens a specific folder
+python ghsync_gui.py                      # opens the last project you used
+python ghsync_gui.py C:\Projects\my-site  # opens (and adds to the list) a specific folder
 python ghsync_gui.py C:\Projects\my-site --tray   # starts hidden in the tray
 ```
 
-Keep `ghsync_gui.py` in the same folder as `ghsync.py`.
+Keep `ghsync_gui.py` and `ghsync_projects.py` in the same folder as `ghsync.py`.
+
+### Projects (0.4)
+
+The left panel lists every project folder you manage. Click one to open it in the sync view; everything below works exactly as before, on that one project.
+
+- **ADD** a folder (linked or not), **REMOVE** it from the list, or **CHECK ALL** for a fresh status of every project. Removing only forgets the folder; its files, its `.ghsync/` settings and its GitHub repo are untouched.
+- **Status column:** `IN SYNC`, `N LOCAL CHANGES`, `GITHUB CHANGED`, `BOTH CHANGED`, `NEVER SYNCED`, `NOT LINKED`, `ERROR` (hover for the reason) or `CLASH`. The open project shows its live count (`N PENDING`, `N CONFLICTS`). The others are checked in the background when the window opens and every 5 minutes, one project at a time, with one GitHub request each. The open project is never scanned in the background, so a status check can't collide with your sync.
+- **One operation at a time.** You can't switch projects while a sync, push or pull is running. Results from a background scan of a project you've just left are discarded, never shown under the new one.
+- **No bulk actions.** Every sync is started by you, on one project, with that project's own confirmation dialogs. Watching and notifications cover the open project.
+- **Safety rules for the list:**
+  - A folder is identified by its real location, so a junction or symlink pointing at a listed folder counts as the same folder.
+  - Folders can't be nested inside each other. Like the next rule, this is enforced by the engine: a folder inside, or containing, a listed project is refused for `push`, `pull`, `sync`, `link` and `init` from the command line too. The listed project itself is unaffected.
+  - Two projects can't sync to the same repo and branch, because with Protect local each would keep undoing the other. This is checked when adding and when linking. If it happens anyway (for example by editing a config by hand), the row shows `CLASH` and syncing that project is blocked until it's resolved.
+  - **The engine enforces this rule, not just the window.** `push`, `pull`, `sync`, `link` and `init` from the command line refuse any folder, listed or not, whose repo and branch another listed project owns. `status`, `diff` and `--dry-run` stay available. If the project list can't be read, syncing is refused rather than allowed. With no project list at all (CLI-only use), nothing changes.
+  - These are **admission checks**: they run when an operation starts, under that project's lock, against the project list as it is at that moment. Changing the list or a link while a sync is already running isn't detected until the next operation. No global lock is held while talking to GitHub.
+  - Only listed folders can be open in the window. A folder that can't be added (nested, missing, clashing) is never opened, even when passed on the command line.
+- **`IN SYNC` in the list** means no changes were detected since that project's last sync: its files match the recorded baseline and GitHub's branch hasn't moved. It isn't a file-by-file comparison with GitHub; opening the project gives the authoritative plan.
+- The list lives in `%APPDATA%\ghsync\projects.json` (set `GHSYNC_HOME` to move it). If it's ever damaged, GHSYNC says so and leaves it untouched. The folder you last used in 0.3 is added automatically on first start; add your other projects with **ADD**.
 
 - **First run on a folder:** save your token, then either create a new repo from the folder or link an existing one.
 - **Counters and list:** PUSH, PULL, CONFLICT and IN SYNC counts sit above the list of every pending file, tagged ADD, MOD or DEL.
@@ -128,6 +146,7 @@ Keep `ghsync_gui.py` in the same folder as `ghsync.py`.
 - **PROTECT LOCAL** (bottom bar, on by default): files GitHub changed show as **⟲ MIRROR** rows and SYNC puts your version back. PULL and KEEP GITHUB become a one-time override that lists the affected files and backs them up first. Unticking it asks for confirmation.
 - **Conflicts:** select the conflicting files and choose **KEEP LOCAL** (overwrite GitHub) or **KEEP GITHUB** (overwrite your copy). Each asks for confirmation.
 - **Deletions** always ask first. The window also refreshes when you click back into it.
+- **Logs stay with their job.** Each background job's output goes only to its own log, even when other work runs at the same time.
 
 ### Tray mode
 
@@ -211,7 +230,7 @@ Ignore rules apply to both sides. Ignoring a file that was already synced does *
 
 ## Status
 
-0.3.4: fixes a GUI bug where a confirmed SYNC could be silently dropped when closing the confirmation dialog started a refresh. 0.3.3: with Protect local on, PUSH sends your version of conflicts too (before, it left them untouched). 0.3.2: the stale-branch guard fails closed when GitHub can't confirm the branch relationship (GHS-011). 0.3.1: guards against GitHub briefly reporting an older branch head, which could otherwise roll a two-way sync back to old content. 0.3.0: **Protect local**, on by default (above), plus backups of every local file a pull replaces or deletes. 0.2.2: `.gitignore` and `.packagerignore` are always honoured alongside `.ghignore`. 0.2.1, "Safe Sync". 0.2 fixed the filesystem-safety, concurrency and recovery findings from an independent review (GHS-001 to GHS-008); 0.2.1 fixes the one defect found in the follow-up review (GHS-009: temp cleanup could delete user files ending in `.ghsync-tmp`). No new features.
+0.4.2: the no-nesting rule is enforced by the engine as well, for every entry point (GHS-016). 0.4.1: the one-folder-per-branch rule is enforced by the engine, so the CLI obeys it too (GHS-014); a folder that fails registration can't be opened (GHS-015); the project list is validated on load. The engine's only change since 0.3.4 is that added check. 0.4.0: **multi-project GUI** (above). 0.3.4: fixes a GUI bug where a confirmed SYNC could be silently dropped when closing the confirmation dialog started a refresh. 0.3.3: with Protect local on, PUSH sends your version of conflicts too (before, it left them untouched). 0.3.2: the stale-branch guard fails closed when GitHub can't confirm the branch relationship (GHS-011). 0.3.1: guards against GitHub briefly reporting an older branch head, which could otherwise roll a two-way sync back to old content. 0.3.0: **Protect local**, on by default (above), plus backups of every local file a pull replaces or deletes. 0.2.2: `.gitignore` and `.packagerignore` are always honoured alongside `.ghignore`. 0.2.1, "Safe Sync". 0.2 fixed the filesystem-safety, concurrency and recovery findings from an independent review (GHS-001 to GHS-008); 0.2.1 fixes the one defect found in the follow-up review (GHS-009: temp cleanup could delete user files ending in `.ghsync-tmp`). No new features.
 
 The regression suite in `tests/` runs against an in-memory GitHub, over real HTTP for the CLI, and drives the real GUI offscreen. Every fix and feature has a test that fails on the build before it and passes on the current one. On Windows the suite also creates real NTFS junctions (`mklink /J`, no admin rights needed) and uses the real `msvcrt` lock.
 
@@ -226,7 +245,8 @@ The second command runs the same scenarios against the **real** GitHub API on a 
 
 ```
 ghsync.py        command-line tool and sync engine
-ghsync_gui.py    PyQt6 desktop GUI and tray watcher (imports ghsync.py)
+ghsync_gui.py    PyQt6 desktop GUI: project list, sync view, tray watcher
+ghsync_projects.py  project registry and dashboard status (Qt-free, uses ghsync.py)
 run_tests.bat    runs the regression suite
 tests/           regression tests, fake GitHub, real-GitHub smoke test
 docs/            screenshots used in this README
