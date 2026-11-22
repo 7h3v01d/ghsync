@@ -70,7 +70,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 API = os.environ.get("GHSYNC_API", "https://api.github.com")
 STATE_DIR = ".ghsync"
@@ -80,8 +80,13 @@ TMP_SUFFIX = ".ghsync-tmp"
 DEFAULT_IGNORE = [
     ".git/", ".ghsync/", "node_modules/", "__pycache__/", "*.pyc",
     ".DS_Store", "Thumbs.db", "desktop.ini", ".env", ".venv/", "venv/",
+    # tool caches and generated metadata: always rebuilt, never source (0.4.3)
+    ".pytest_cache/", "*.egg-info/", ".mypy_cache/", ".ruff_cache/", ".tox/", ".nox/",
+    ".hypothesis/", ".ipynb_checkpoints/",
     "*" + TMP_SUFFIX,
 ]
+# build/ and dist/ are deliberately NOT built in: some projects commit them, and built-in
+# rules can't be overridden. Add them to .gitignore/.ghignore/.packagerignore if wanted.
 CASE_INSENSITIVE_FS = sys.platform in ("win32", "darwin")
 
 _O_BINARY = getattr(os, "O_BINARY", 0)

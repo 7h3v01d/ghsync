@@ -764,6 +764,53 @@ class TestStaleBranchRead(Base):
         self.assertEqual(self.read("a.txt"), b"newer")
 
 
+# ============== 0.4.3: tool caches are skipped by default
+class TestDefaultCaches(Base):
+    CACHES = {
+        ".pytest_cache/v/cache/lastfailed": "{}",
+        "src/portal.egg-info/PKG-INFO": "Metadata-Version: 2.1",
+        "portal.egg-info/SOURCES.txt": "x",
+        ".mypy_cache/3.11/x.json": "{}",
+        ".ruff_cache/0.1/y": "z",
+        ".tox/py311/log": "l",
+        ".nox/s/log": "l",
+        ".hypothesis/examples/e": "e",
+        "notebooks/.ipynb_checkpoints/n-checkpoint.ipynb": "{}",
+        "sub/__pycache__/m.cpython-311.pyc": "b",
+    }
+
+    def test_tool_caches_are_never_pushed(self):
+        for p, d in self.CACHES.items():
+            self.write(p, d)
+        self.write("src/app.py", "code")
+        self.write("build/keep.txt", "build/ and dist/ are NOT built-in: some repos commit them")
+        self.write("dist/keep.txt", "kept")
+        self.sync()
+        self.assertEqual(set(self.gh.files()), {"src/app.py", "build/keep.txt", "dist/keep.txt"})
+
+    def test_caches_on_github_are_not_pulled(self):
+        self.synced({"a.txt": "a"})
+        self.gh.commit_files({".pytest_cache/README.md": b"x", "pkg.egg-info/PKG-INFO": b"y"}, keep=True)
+        self.sync()
+        self.assertFalse(self.exists(".pytest_cache"))
+        self.assertFalse(self.exists("pkg.egg-info"))
+
+    def test_caches_already_on_github_are_left_alone_not_deleted(self):
+        self.synced({"a.txt": "a"})
+        # pushed by an older version, before these were skipped by default
+        self.gh.commit_files({".pytest_cache/v/cache/nodeids": b"[]"}, keep=True)
+        self.write(".pytest_cache/v/cache/nodeids", "[]")
+        self.sync()
+        self.assertIn(".pytest_cache/v/cache/nodeids", self.gh.files())
+
+    def test_names_that_only_look_similar_still_sync(self):
+        for p in ("egg-info.md", "docs/pytest_cache_notes.md", "my.egg-info.txt", "tox/config.ini"):
+            self.write(p, "real content")
+        self.sync()
+        self.assertTrue({"egg-info.md", "docs/pytest_cache_notes.md", "my.egg-info.txt",
+                         "tox/config.ini"} <= set(self.gh.files()))
+
+
 # ================================== extra findings from verification (not in review)
 class TestWindowsLinks(Base):
     def _fake_junction(self, rel):

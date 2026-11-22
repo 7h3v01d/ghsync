@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ghsync  # noqa: E402
 import ghsync_projects as gp  # noqa: E402
 
-APP_VERSION = "0.4.2"      # GUI and engine share the version from 0.4.1
+APP_VERSION = "0.4.3"      # GUI and engine share the version from 0.4.1
 
 from PyQt6.QtCore import QEvent, QPointF, QSettings, Qt, QThread, QTimer, pyqtSignal  # noqa: E402
 from PyQt6.QtGui import (QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap,  # noqa: E402
